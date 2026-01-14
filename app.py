@@ -490,12 +490,26 @@ if player_col is None:
 else:
     p1, p2 = st.columns(2)
 
-    def player_involvement(team_name: str):
-        dd = dff[dff[team_col] == team_name].dropna(subset=[player_col])
+    def player_involvement(team_name: str) -> pd.DataFrame:
+        dd = dff[dff[team_col] == team_name].dropna(subset=[player_col]).copy()
+
         # Total involvements (count of player possessions)
-        total = dd[player_col].value_counts().rename("player_possessions").reset_index().rename(columns={"index": "player"})
+        # Use reset_index(name=...) to be robust across pandas versions.
+        total = (
+            dd[player_col]
+            .value_counts()
+            .reset_index(name="player_possessions")
+            .rename(columns={player_col: "player"})
+        )
+
         # Unique sequences involved in
-        seqs = dd.groupby(player_col)["team_possession_seq"].nunique().rename("sequences_involved").reset_index().rename(columns={player_col: "player"})
+        seqs = (
+            dd.groupby(player_col)["team_possession_seq"]
+            .nunique()
+            .reset_index(name="sequences_involved")
+            .rename(columns={player_col: "player"})
+        )
+
         out = total.merge(seqs, on="player", how="left")
         return out
 
