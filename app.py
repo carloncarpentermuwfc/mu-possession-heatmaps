@@ -1233,8 +1233,8 @@ with st.sidebar:
     st.header("Effectiveness filters")
 
     # Team selection for this section
-    eff_teams = st.multiselect("Teams to include (effectiveness)", sorted(seq_eff["team"].dropna().unique().tolist()),
-                              default=eff_teams_all).unique() else None)
+    eff_teams_all = sorted(seq_eff["team"].dropna().astype(str).unique().tolist())
+    eff_teams = st.multiselect("Teams to include (effectiveness)", eff_teams_all, default=eff_teams_all)
 
     # Game state / score filters if present
     gs_col = None
