@@ -4,6 +4,7 @@ import numpy as np
 import pandas as pd
 import streamlit as st
 import matplotlib.pyplot as plt
+import plotly.graph_objects as go
 
 # KDE dependency
 try:
@@ -382,8 +383,7 @@ if zone_target != "None":
         dff = dff[dff["_zone_third"] == third_choice].copy()
 
     elif zone_mode == "Pitch zones":
-        # Define a simple pitch grid: 6 columns (length) x 4 rows (width) = 24 zones
-        # x range [-52.5, 52.5], y range [-34, 34]
+        # Define a pitch grid: 6 columns (length) x 4 rows (width) = 24 zones
         x_edges = np.linspace(-52.5, 52.5, 7)  # 6 bins
         y_edges = np.linspace(-34.0, 34.0, 5)  # 4 bins
 
@@ -394,20 +394,106 @@ if zone_target != "None":
             yi = np.searchsorted(y_edges, y, side="right") - 1
             if xi < 0 or xi >= 6 or yi < 0 or yi >= 4:
                 return None
-            # Row 0 is bottom (y low) -> map to pitch "bottom"; we'll display top row first in UI
-            return f"Z{yi+1}-{xi+1}"  # (row)-(col), 1-indexed
+            return f"Z{yi+1}-{xi+1}"  # row-col (1-indexed), row is bottom->top
 
-        # Sidebar "selectable pitch" using a checkbox grid (top row first)
+        # Build zone centers for clickable selection
+        zone_centers = []
+        zone_ids = []
+        for r in range(4):      # rows (bottom->top)
+            for c in range(6):  # cols (left->right)
+                x0, x1 = x_edges[c], x_edges[c+1]
+                y0, y1 = y_edges[r], y_edges[r+1]
+                zone_centers.append(((x0 + x1) / 2.0, (y0 + y1) / 2.0))
+                zone_ids.append(f"Z{r+1}-{c+1}")
+
+        # Persist selection in session_state
+        if "selected_zones" not in st.session_state:
+            st.session_state["selected_zones"] = []
+
         with st.sidebar:
-            st.markdown("**Select zones on the pitch** (checkbox grid)")
-            st.caption("6 (length) × 4 (width) zones. Choose one or more.")
-            selected = []
-            for ui_row in range(3, -1, -1):  # show top to bottom
-                cols = st.columns(6, gap="small")
-                for ui_col in range(6):
-                    zid = f"Z{ui_row+1}-{ui_col+1}"
-                    if cols[ui_col].checkbox(zid, value=False, key=f"zone_{zid}"):
-                        selected.append(zid)
+            st.markdown("**Clickable pitch – select zones**")
+            st.caption("Click points to select. Use box/lasso to multi-select. Double-click to reset selection.")
+            show_zone_labels = st.checkbox("Show zone labels", value=False)
+
+        # Plotly pitch + clickable zone points
+        def make_pitch_zone_fig(selected):
+            xs = [p[0] for p in zone_centers]
+            ys = [p[1] for p in zone_centers]
+            texts = zone_ids if show_zone_labels else [""] * len(zone_ids)
+
+            fig = go.Figure()
+
+            # Zone points
+            fig.add_trace(go.Scatter(
+                x=xs, y=ys,
+                mode="markers+text" if show_zone_labels else "markers",
+                text=texts,
+                textposition="middle center",
+                customdata=zone_ids,
+                marker=dict(size=16, opacity=0.85),
+                selected=dict(marker=dict(size=18, opacity=1.0)),
+                unselected=dict(marker=dict(opacity=0.45)),
+            ))
+
+            # Pitch outline + key markings as shapes
+            shapes = []
+            # Outline
+            shapes.append(dict(type="rect", x0=-52.5, y0=-34, x1=52.5, y1=34, line=dict(width=2)))
+            # Halfway
+            shapes.append(dict(type="line", x0=0, y0=-34, x1=0, y1=34, line=dict(width=2)))
+            # Centre circle (approx with many points via shape circle)
+            shapes.append(dict(type="circle", x0=-9.15, y0=-9.15, x1=9.15, y1=9.15, line=dict(width=2)))
+            # Penalty areas
+            shapes.append(dict(type="rect", x0=-52.5, y0=-20.15, x1=-36, y1=20.15, line=dict(width=2)))
+            shapes.append(dict(type="rect", x0=36, y0=-20.15, x1=52.5, y1=20.15, line=dict(width=2)))
+
+            # Grid lines
+            for xe in x_edges[1:-1]:
+                shapes.append(dict(type="line", x0=xe, y0=-34, x1=xe, y1=34, line=dict(width=1, dash="dot")))
+            for ye in y_edges[1:-1]:
+                shapes.append(dict(type="line", x0=-52.5, y0=ye, x1=52.5, y1=ye, line=dict(width=1, dash="dot")))
+
+            # Highlight selected zones as translucent rectangles
+            for zid in selected:
+                r, c = zid[1:].split("-")
+                r = int(r) - 1
+                c = int(c) - 1
+                x0, x1 = x_edges[c], x_edges[c+1]
+                y0, y1 = y_edges[r], y_edges[r+1]
+                shapes.append(dict(type="rect", x0=x0, y0=y0, x1=x1, y1=y1,
+                                   fillcolor="rgba(0,0,0,0.15)", line=dict(width=0)))
+
+            fig.update_layout(
+                shapes=shapes,
+                margin=dict(l=10, r=10, t=10, b=10),
+                xaxis=dict(range=[-55, 55], showgrid=False, zeroline=False, visible=False),
+                yaxis=dict(range=[-37, 37], showgrid=False, zeroline=False, visible=False, scaleanchor="x", scaleratio=1),
+                dragmode="select",  # enables box select (and lasso via modebar)
+                height=320,
+            )
+            return fig
+
+        fig = make_pitch_zone_fig(st.session_state["selected_zones"])
+
+        # Streamlit selection events (no extra component needed)
+        sel = st.plotly_chart(fig, use_container_width=True, key="zone_pitch", on_select="rerun")
+        # On Streamlit versions that support selection events, selection is stored in session_state:
+        # st.session_state["zone_pitch"] contains {"selection": {...}} when available.
+        sel_state = st.session_state.get("zone_pitch", {})
+        selection = sel_state.get("selection", None)
+
+        if selection and "points" in selection and selection["points"]:
+            newly_selected = [p.get("customdata") for p in selection["points"] if p.get("customdata")]
+            # Update selection (toggle behavior)
+            current = set(st.session_state["selected_zones"])
+            for z in newly_selected:
+                if z in current:
+                    current.remove(z)
+                else:
+                    current.add(z)
+            st.session_state["selected_zones"] = sorted(current)
+
+        selected = st.session_state["selected_zones"]
 
         if selected:
             dff["_zone_id"] = [zone_id_for_xy(x, y) for x, y in zip(dff[zx], dff[zy])]
@@ -415,27 +501,6 @@ if zone_target != "None":
         else:
             st.sidebar.warning("No zones selected — zone filter not applied.")
 
-        # Show a pitch preview with selected zones highlighted
-        with st.expander("Show selected zones on pitch"):
-            fig, ax = plt.subplots(figsize=(10, 6))
-            draw_pitch(ax)
-            # Draw grid lines
-            for xe in x_edges[1:-1]:
-                ax.plot([xe, xe], [-34, 34], linewidth=0.7, alpha=0.6)
-            for ye in y_edges[1:-1]:
-                ax.plot([-52.5, 52.5], [ye, ye], linewidth=0.7, alpha=0.6)
-
-            # Highlight selected zones
-            for zid in selected:
-                # zid = Zr-c
-                r, c = zid[1:].split("-")
-                r = int(r) - 1
-                c = int(c) - 1
-                x0, x1 = x_edges[c], x_edges[c+1]
-                y0, y1 = y_edges[r], y_edges[r+1]
-                ax.fill([x0, x1, x1, x0], [y0, y0, y1, y1], alpha=0.25)
-
-            st.pyplot(fig, use_container_width=True)
 
     else:
         with st.sidebar:
