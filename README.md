@@ -1,13 +1,17 @@
+[README.md](https://github.com/user-attachments/files/24608920/README.md)
 # MU Possession KDE Comparison (Streamlit)
 
 A Streamlit app for analysing **team possession sequence end locations** (e.g., where possessions finish) using **KDE heatmaps** over a pitch, and comparing **Manchester United vs opponents** (or any two teams in the dataset).
 
 ## Features
 - Upload a possessions CSV (or place it at `data/possessions.csv`)
-- Aggregates to **team possession sequence ends** using `last_player_possession_in_team_possession == True` (when present)
+- Derives a **team possession sequence id** per match (from `first_player_possession_in_team_possession` when available)
+- Aggregates to **team possession sequence ends** (from `last_player_possession_in_team_possession` when available)
 - KDE heatmap per team with a pitch layout
-- Optional **difference view** (Team A density − Team B density)
-- Filters for matches (and phase/half when available)
+- **Effectiveness comparisons** (shot/goal rates if available, duration, x-progression, end-zone rates)
+- **Player involvement** (most involved + sequences participated)
+- **Player combinations** (top pass-link pairs via `player_targeted_name`)
+- **Passing network graphs** (nodes=players, edges=pass links weighted by frequency)
 
 ## Getting started
 
