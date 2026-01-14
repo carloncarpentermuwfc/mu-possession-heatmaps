@@ -718,6 +718,216 @@ with dist_col2:
     st.pyplot(fig, use_container_width=True)
 
 # --- Player involvement ---
+
+# ============================================================
+# Advanced effectiveness dashboard (filters + multi-team charts)
+# ============================================================
+st.header("Effectiveness dashboard (compare teams)")
+
+st.caption(
+    "This section compares possession-sequence effectiveness across teams using one-row-per-sequence data. "
+    "Filters apply at the **sequence level** (not individual player possessions)."
+)
+
+# --- Build sequence-level helper columns ---
+seq_eff = seq_summary.copy()
+
+# Add thirds labels for starts/ends (always available from x coords)
+seq_eff["start_third"] = seq_eff["start_x"].apply(label_third_from_x) if "start_x" in seq_eff.columns else "Unknown"
+seq_eff["end_third"] = seq_eff["end_x"].apply(label_third_from_x) if "end_x" in seq_eff.columns else "Unknown"
+seq_eff["thirds_progressed_seq"] = [thirds_progressed(s, e) for s, e in zip(seq_eff.get("start_x", np.nan), seq_eff.get("end_x", np.nan))]
+
+# --- Sequence-level filters ---
+with st.sidebar:
+    st.header("Effectiveness filters")
+
+    # Team selection for this section
+    eff_teams = st.multiselect("Teams to include (effectiveness)", sorted(seq_eff["team"].dropna().unique().tolist()),
+                              default=[str(left_team), str(right_team)] if str(left_team) in seq_eff["team"].astype(str).unique() else None)
+
+    # Game state / score filters if present
+    gs_col = None
+    for cand in ["game_state", "gameState", "possession_game_state", "match_state"]:
+        if cand in seq_eff.columns:
+            gs_col = cand
+            break
+
+    score_diff_col = None
+    for cand in ["score_diff", "goal_diff", "score_difference", "scoreDelta"]:
+        if cand in seq_eff.columns:
+            score_diff_col = cand
+            break
+
+    # Time filters if present
+    minute_col = None
+    for cand in ["minute_start", "minute", "start_minute"]:
+        if cand in seq_eff.columns:
+            minute_col = cand
+            break
+
+# Apply filters
+if eff_teams:
+    seq_eff = seq_eff[seq_eff["team"].astype(str).isin([str(t) for t in eff_teams])].copy()
+
+# Game state filter
+if gs_col is not None:
+    with st.sidebar:
+        gs_opts = ["All"] + sorted([x for x in seq_eff[gs_col].dropna().unique().tolist()])
+        gs_choice = st.selectbox("Game state", gs_opts, index=0)
+    if gs_choice != "All":
+        seq_eff = seq_eff[seq_eff[gs_col] == gs_choice].copy()
+else:
+    with st.sidebar:
+        st.caption("Game state filter: column not found (skipping).")
+
+# Score diff filter
+if score_diff_col is not None:
+    seq_eff[score_diff_col] = pd.to_numeric(seq_eff[score_diff_col], errors="coerce")
+    with st.sidebar:
+        sd_min = float(np.nanmin(seq_eff[score_diff_col].values)) if len(seq_eff) else -3.0
+        sd_max = float(np.nanmax(seq_eff[score_diff_col].values)) if len(seq_eff) else 3.0
+        # keep sane bounds
+        sd_min = min(sd_min, 0.0)
+        sd_max = max(sd_max, 0.0)
+        sd_range = st.slider("Score diff range", min_value=float(sd_min), max_value=float(sd_max), value=(float(sd_min), float(sd_max)))
+    seq_eff = seq_eff[(seq_eff[score_diff_col] >= sd_range[0]) & (seq_eff[score_diff_col] <= sd_range[1])].copy()
+else:
+    with st.sidebar:
+        st.caption("Score-diff filter: column not found (skipping).")
+
+# Minute range filter
+if minute_col is not None:
+    seq_eff[minute_col] = pd.to_numeric(seq_eff[minute_col], errors="coerce")
+    with st.sidebar:
+        m_min = int(np.nanmin(seq_eff[minute_col].values)) if len(seq_eff) else 0
+        m_max = int(np.nanmax(seq_eff[minute_col].values)) if len(seq_eff) else 90
+        m_range = st.slider("Minute range", min_value=int(m_min), max_value=int(m_max), value=(int(m_min), int(m_max)))
+    seq_eff = seq_eff[(seq_eff[minute_col] >= m_range[0]) & (seq_eff[minute_col] <= m_range[1])].copy()
+else:
+    with st.sidebar:
+        st.caption("Minute filter: column not found (skipping).")
+
+# Start/end third filters
+with st.sidebar:
+    st.subheader("Location filters (sequence-level)")
+    start_third_choice = st.multiselect("Start third", ["Defensive", "Middle", "Attacking"], default=["Defensive", "Middle", "Attacking"])
+    end_third_choice = st.multiselect("End third", ["Defensive", "Middle", "Attacking"], default=["Defensive", "Middle", "Attacking"])
+    min_thirds_prog = st.slider("Min thirds progressed", min_value=0, max_value=2, value=0)
+
+seq_eff = seq_eff[seq_eff["start_third"].isin(start_third_choice)].copy()
+seq_eff = seq_eff[seq_eff["end_third"].isin(end_third_choice)].copy()
+seq_eff = seq_eff[seq_eff["thirds_progressed_seq"] >= min_thirds_prog].copy()
+
+# Optional: filter by in-possession phase type if present (sequence-level best-effort)
+if "team_in_possession_phase_type" in dff.columns:
+    with st.sidebar:
+        phase_seq_opts = ["All"] + sorted([x for x in dff["team_in_possession_phase_type"].dropna().unique().tolist()])
+        phase_seq_choice = st.selectbox("Phase (in-possession)", phase_seq_opts, index=0)
+    if phase_seq_choice != "All":
+        # Approx: keep sequences that contain at least one row with this phase type
+        keep = (
+            dff[dff["team_in_possession_phase_type"] == phase_seq_choice][["match_id", "team_possession_seq"]]
+            .dropna()
+            .drop_duplicates()
+        )
+        seq_eff = seq_eff.merge(keep, on=["match_id", "team_possession_seq"], how="inner")
+
+# --- Summary table: effectiveness per team ---
+def team_effectiveness_table(d: pd.DataFrame) -> pd.DataFrame:
+    if len(d) == 0:
+        return pd.DataFrame(columns=["team", "sequences", "shot_rate", "goal_rate", "avg_duration", "avg_x_prog", "end_final_third_rate", "end_pen_area_rate"])
+
+    out = d.groupby("team", as_index=False).agg(
+        sequences=("team", "size"),
+        shot_rate=("lead_to_shot", lambda s: pd.Series(s).fillna(False).astype(bool).mean()),
+        goal_rate=("lead_to_goal", lambda s: pd.Series(s).fillna(False).astype(bool).mean()),
+        avg_duration=("duration", "mean"),
+        avg_x_prog=("progression_x", "mean"),
+        avg_thirds_progressed=("thirds_progressed_seq", "mean"),
+    )
+
+    # End zone rates if present
+    if "third_end" in d.columns and d["third_end"].notna().any():
+        out["end_final_third_rate"] = d.groupby("team")["third_end"].apply(lambda s: s.astype(str).str.contains("attacking", case=False, na=False).mean()).values
+    else:
+        out["end_final_third_rate"] = np.nan
+
+    if "penalty_area_end" in d.columns and d["penalty_area_end"].notna().any():
+        out["end_pen_area_rate"] = d.groupby("team")["penalty_area_end"].apply(lambda s: pd.Series(s).fillna(False).astype(bool).mean()).values
+    else:
+        out["end_pen_area_rate"] = np.nan
+
+    return out.sort_values("sequences", ascending=False)
+
+team_tbl = team_effectiveness_table(seq_eff)
+
+kpi1, kpi2, kpi3 = st.columns(3)
+kpi1.metric("Teams in view", int(team_tbl["team"].nunique()) if len(team_tbl) else 0)
+kpi2.metric("Sequences in view", int(seq_eff.shape[0]))
+kpi3.metric("Avg thirds progressed (all)", f"{seq_eff['thirds_progressed_seq'].mean():.2f}" if len(seq_eff) else "—")
+
+st.dataframe(team_tbl, use_container_width=True, hide_index=True)
+
+# --- Charts: compare teams ---
+if len(team_tbl) > 0:
+    st.subheader("Team comparison charts")
+
+    metric_options = [
+        ("shot_rate", "Shot rate"),
+        ("goal_rate", "Goal rate"),
+        ("avg_duration", "Avg duration"),
+        ("avg_x_prog", "Avg x progression"),
+        ("avg_thirds_progressed", "Avg thirds progressed"),
+        ("end_final_third_rate", "End in final third rate"),
+        ("end_pen_area_rate", "End in penalty area rate"),
+    ]
+    available_metrics = [(k, lbl) for k, lbl in metric_options if k in team_tbl.columns and team_tbl[k].notna().any()]
+    metric_key, metric_label = st.selectbox("Metric", available_metrics, format_func=lambda x: x[1])
+
+    # Bar chart
+    fig, ax = plt.subplots(figsize=(10, 5))
+    plot_df = team_tbl.sort_values(metric_key, ascending=False).copy()
+    ax.bar(plot_df["team"].astype(str), plot_df[metric_key].astype(float))
+    ax.set_title(f"Teams by {metric_label}")
+    ax.set_ylabel(metric_label)
+    ax.set_xticklabels(plot_df["team"].astype(str), rotation=20, ha="right")
+    st.pyplot(fig, use_container_width=True)
+
+    # Distribution by team (top 2 only for readability)
+    top2 = plot_df["team"].astype(str).head(2).tolist()
+    if len(top2) == 2:
+        fig, ax = plt.subplots(figsize=(10, 4.5))
+        a = seq_eff[seq_eff["team"].astype(str) == top2[0]][metric_key].dropna().astype(float).values
+        b = seq_eff[seq_eff["team"].astype(str) == top2[1]][metric_key].dropna().astype(float).values
+        ax.hist(a, bins=30, alpha=0.6, label=top2[0])
+        ax.hist(b, bins=30, alpha=0.6, label=top2[1])
+        ax.set_title(f"Distribution of {metric_label}: {top2[0]} vs {top2[1]}")
+        ax.set_xlabel(metric_label)
+        ax.set_ylabel("Count")
+        ax.legend()
+        st.pyplot(fig, use_container_width=True)
+
+    # Start vs end common areas (quick view)
+    st.subheader("Start vs end areas for filtered sequences")
+    tcols = st.columns(2)
+    with tcols[0]:
+        fig, ax = plt.subplots(figsize=(8, 5))
+        img = plot_kde(ax, seq_eff["start_x"].dropna().values, seq_eff["start_y"].dropna().values)
+        ax.set_title("START locations (filtered sequences)")
+        if img is not None:
+            plt.colorbar(img, ax=ax, fraction=0.046, pad=0.04)
+        st.pyplot(fig, use_container_width=True)
+    with tcols[1]:
+        fig, ax = plt.subplots(figsize=(8, 5))
+        img = plot_kde(ax, seq_eff["end_x"].dropna().values, seq_eff["end_y"].dropna().values)
+        ax.set_title("END locations (filtered sequences)")
+        if img is not None:
+            plt.colorbar(img, ax=ax, fraction=0.046, pad=0.04)
+        st.pyplot(fig, use_container_width=True)
+else:
+    st.info("No sequences available under current effectiveness filters.")
+
+
 st.subheader("Who is most involved?")
 
 player_col = "player_name" if "player_name" in dff.columns else None
