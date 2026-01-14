@@ -1007,6 +1007,8 @@ if player_col is None or target_col is None:
 else:
     with st.sidebar:
         st.header("Network settings")
+        show_bg_heatmap = st.checkbox("Background heatmap behind network", value=True)
+        bg_heatmap_target = st.selectbox("Heatmap source", ["Possession end locations", "Possession start locations"], index=0)
         min_link_weight = st.slider("Minimum links to show", min_value=1, max_value=20, value=3, step=1)
         top_edges = st.slider("Max edges to draw", min_value=10, max_value=200, value=60, step=10)
         overlay_on_pitch = st.checkbox("Overlay network on pitch", value=True)
@@ -1091,7 +1093,20 @@ else:
             nx.draw_networkx_edges(G, pos, ax=ax, width=widths, arrows=True, arrowsize=12, alpha=0.6)
             nx.draw_networkx_labels(G, pos, ax=ax, font_size=9)
 
-        def draw_pitch_overlay(ax, G, positions: dict, title: str):
+        def draw_pitch_overlay(ax, G, positions: dict, title: str, team_name: str):
+            # Optional background density heatmap
+            if show_bg_heatmap and SCIPY_OK:
+                src_x, src_y = ('x_end','y_end') if bg_heatmap_target.startswith('Possession end') else ('x_start','y_start')
+                ddh = dff[dff[team_col] == team_name].dropna(subset=[src_x, src_y]).copy()
+                if len(ddh) > 1:
+                    _, _, zz = kde_density_grid(ddh[src_x].values, ddh[src_y].values)
+                    ax.imshow(
+                        zz.T,
+                        origin='lower',
+                        extent=[-52.5, 52.5, -34, 34],
+                        alpha=0.35,
+                        aspect='equal'
+                    )
             draw_pitch(ax)
             ax.set_title(title)
 
@@ -1157,7 +1172,7 @@ else:
         with n1:
             fig, ax = plt.subplots(figsize=(7, 6))
             if overlay_on_pitch:
-                draw_pitch_overlay(ax, netA, posA, f"{left_team} passing network (pitch overlay)")
+                draw_pitch_overlay(ax, netA, posA, f"{left_team} passing network (pitch overlay)", str(left_team))
             else:
                 draw_layout_graph(ax, netA, f"{left_team} passing network", layout=fallback_layout)
             st.pyplot(fig, use_container_width=True)
@@ -1167,7 +1182,7 @@ else:
         with n2:
             fig, ax = plt.subplots(figsize=(7, 6))
             if overlay_on_pitch:
-                draw_pitch_overlay(ax, netB, posB, f"{right_team} passing network (pitch overlay)")
+                draw_pitch_overlay(ax, netB, posB, f"{right_team} passing network (pitch overlay)", str(right_team))
             else:
                 draw_layout_graph(ax, netB, f"{right_team} passing network", layout=fallback_layout)
             st.pyplot(fig, use_container_width=True)
