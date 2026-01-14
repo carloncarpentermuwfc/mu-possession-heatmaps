@@ -895,18 +895,51 @@ if len(team_tbl) > 0:
     st.pyplot(fig, use_container_width=True)
 
     # Distribution by team (top 2 only for readability)
+    # Some selected metrics are team-level aggregates (e.g., shot_rate) and don't exist as raw sequence columns.
+    # Map them back to an underlying sequence column (or a derived boolean) for distributions.
+    dist_source = metric_key
+    if metric_key == "shot_rate":
+        dist_source = "lead_to_shot"
+    elif metric_key == "goal_rate":
+        dist_source = "lead_to_goal"
+    elif metric_key == "end_final_third_rate":
+        dist_source = "__end_final_third__"
+    elif metric_key == "end_pen_area_rate":
+        dist_source = "__end_pen_area__"
+
     top2 = plot_df["team"].astype(str).head(2).tolist()
     if len(top2) == 2:
-        fig, ax = plt.subplots(figsize=(10, 4.5))
-        a = seq_eff[seq_eff["team"].astype(str) == top2[0]][metric_key].dropna().astype(float).values
-        b = seq_eff[seq_eff["team"].astype(str) == top2[1]][metric_key].dropna().astype(float).values
-        ax.hist(a, bins=30, alpha=0.6, label=top2[0])
-        ax.hist(b, bins=30, alpha=0.6, label=top2[1])
-        ax.set_title(f"Distribution of {metric_label}: {top2[0]} vs {top2[1]}")
-        ax.set_xlabel(metric_label)
-        ax.set_ylabel("Count")
-        ax.legend()
-        st.pyplot(fig, use_container_width=True)
+        # Build vectors safely
+        def seq_vector(team_name: str):
+            s = seq_eff[seq_eff["team"].astype(str) == team_name].copy()
+            if dist_source in s.columns:
+                return pd.to_numeric(s[dist_source], errors="coerce").dropna().astype(float).values
+            if dist_source == "__end_final_third__":
+                if "third_end" in s.columns:
+                    v = s["third_end"].astype(str).str.contains("attacking", case=False, na=False).astype(float).values
+                    return v
+                return np.array([])
+            if dist_source == "__end_pen_area__":
+                if "penalty_area_end" in s.columns:
+                    v = s["penalty_area_end"].fillna(False).astype(bool).astype(float).values
+                    return v
+                return np.array([])
+            return np.array([])
+
+        a = seq_vector(top2[0])
+        b = seq_vector(top2[1])
+
+        if len(a) > 0 and len(b) > 0:
+            fig, ax = plt.subplots(figsize=(10, 4.5))
+            ax.hist(a, bins=30, alpha=0.6, label=top2[0])
+            ax.hist(b, bins=30, alpha=0.6, label=top2[1])
+            ax.set_title(f"Distribution of {metric_label}: {top2[0]} vs {top2[1]}")
+            ax.set_xlabel(metric_label)
+            ax.set_ylabel("Count")
+            ax.legend()
+            st.pyplot(fig, use_container_width=True)
+        else:
+            st.info("Distribution view isn't available for this metric under current filters.")
 
     # Start vs end common areas (quick view)
     st.subheader("Start vs end areas for filtered sequences")
