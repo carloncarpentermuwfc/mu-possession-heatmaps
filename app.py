@@ -352,7 +352,7 @@ with st.sidebar:
 # Add derived sequence id
 
 
-# Optional: zone filters (by thirds or custom rectangle)
+# Optional: zone filters (by thirds, pitch zones, or custom rectangle)
 with st.sidebar:
     st.subheader("Zone filter")
     zone_target = st.selectbox(
@@ -362,7 +362,7 @@ with st.sidebar:
         help="Filters the underlying rows used for heatmaps, effectiveness, and player sections."
     )
 
-    zone_mode = st.selectbox("Zone mode", ["Thirds", "Custom rectangle"], index=0)
+    zone_mode = st.selectbox("Zone mode", ["Thirds", "Pitch zones", "Custom rectangle"], index=1)
 
 # Apply zone filter (if chosen)
 if zone_target != "None":
@@ -380,6 +380,63 @@ if zone_target != "None":
             third_choice = st.selectbox("Select third", ["Defensive", "Middle", "Attacking"])
         dff["_zone_third"] = dff[zx].apply(label_third_from_x)
         dff = dff[dff["_zone_third"] == third_choice].copy()
+
+    elif zone_mode == "Pitch zones":
+        # Define a simple pitch grid: 6 columns (length) x 4 rows (width) = 24 zones
+        # x range [-52.5, 52.5], y range [-34, 34]
+        x_edges = np.linspace(-52.5, 52.5, 7)  # 6 bins
+        y_edges = np.linspace(-34.0, 34.0, 5)  # 4 bins
+
+        def zone_id_for_xy(x, y):
+            if pd.isna(x) or pd.isna(y):
+                return None
+            xi = np.searchsorted(x_edges, x, side="right") - 1
+            yi = np.searchsorted(y_edges, y, side="right") - 1
+            if xi < 0 or xi >= 6 or yi < 0 or yi >= 4:
+                return None
+            # Row 0 is bottom (y low) -> map to pitch "bottom"; we'll display top row first in UI
+            return f"Z{yi+1}-{xi+1}"  # (row)-(col), 1-indexed
+
+        # Sidebar "selectable pitch" using a checkbox grid (top row first)
+        with st.sidebar:
+            st.markdown("**Select zones on the pitch** (checkbox grid)")
+            st.caption("6 (length) × 4 (width) zones. Choose one or more.")
+            selected = []
+            for ui_row in range(3, -1, -1):  # show top to bottom
+                cols = st.columns(6, gap="small")
+                for ui_col in range(6):
+                    zid = f"Z{ui_row+1}-{ui_col+1}"
+                    if cols[ui_col].checkbox(zid, value=False, key=f"zone_{zid}"):
+                        selected.append(zid)
+
+        if selected:
+            dff["_zone_id"] = [zone_id_for_xy(x, y) for x, y in zip(dff[zx], dff[zy])]
+            dff = dff[dff["_zone_id"].isin(selected)].copy()
+        else:
+            st.sidebar.warning("No zones selected — zone filter not applied.")
+
+        # Show a pitch preview with selected zones highlighted
+        with st.expander("Show selected zones on pitch"):
+            fig, ax = plt.subplots(figsize=(10, 6))
+            draw_pitch(ax)
+            # Draw grid lines
+            for xe in x_edges[1:-1]:
+                ax.plot([xe, xe], [-34, 34], linewidth=0.7, alpha=0.6)
+            for ye in y_edges[1:-1]:
+                ax.plot([-52.5, 52.5], [ye, ye], linewidth=0.7, alpha=0.6)
+
+            # Highlight selected zones
+            for zid in selected:
+                # zid = Zr-c
+                r, c = zid[1:].split("-")
+                r = int(r) - 1
+                c = int(c) - 1
+                x0, x1 = x_edges[c], x_edges[c+1]
+                y0, y1 = y_edges[r], y_edges[r+1]
+                ax.fill([x0, x1, x1, x0], [y0, y0, y1, y1], alpha=0.25)
+
+            st.pyplot(fig, use_container_width=True)
+
     else:
         with st.sidebar:
             x_min, x_max = st.slider("x range", min_value=-52.5, max_value=52.5, value=(-52.5, 52.5), step=0.5)
