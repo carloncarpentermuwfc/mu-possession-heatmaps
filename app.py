@@ -882,7 +882,8 @@ if len(team_tbl) > 0:
         ("end_pen_area_rate", "End in penalty area rate"),
     ]
     available_metrics = [(k, lbl) for k, lbl in metric_options if k in team_tbl.columns and team_tbl[k].notna().any()]
-    metric_key, metric_label = st.selectbox("Metric", available_metrics, format_func=lambda x: x[1])
+    metric_sel = st.selectbox("Metric", available_metrics, format_func=lambda x: x[1])
+    metric_key, metric_label = metric_sel[0], metric_sel[1]
 
     # Bar chart
     fig, ax = plt.subplots(figsize=(10, 5))
