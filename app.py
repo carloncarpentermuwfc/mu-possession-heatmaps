@@ -333,7 +333,7 @@ dff = df[df["match_id"].isin(selected_matches)].copy()
 
 # Optional filters (phase and half)
 with st.sidebar:
-    if "team_in_possession_phase_type" in dff.columns:
+    if "team_in_possession_phase_type" in dff_all.columns:
         phase_opts = ["All"] + sorted([x for x in dff["team_in_possession_phase_type"].dropna().unique().tolist()])
         phase_choice = st.selectbox("In-possession phase", phase_opts, index=0)
         if phase_choice != "All":
@@ -511,6 +511,8 @@ if zone_target != "None":
 dff, seq_warn = add_team_possession_sequence_id(dff)
 if seq_warn:
     st.warning(seq_warn)
+dff_all = dff.copy()  # snapshot before Team A/Team B scope filtering (used for all-teams dashboards)
+
 
 # Teams after filtering
 teams = sorted(dff[team_col].dropna().unique().tolist())
@@ -550,6 +552,7 @@ if scope == "Only matches where both teams appear":
 
 # --- Sequence summaries (effectiveness) ---
 seq_summary = summarise_sequences(dff, team_col=team_col)
+seq_summary_all = summarise_sequences(dff_all, team_col=team_col)
 
 # Ends for heatmaps
 ends, ends_warn = get_team_possession_ends(dff)
@@ -1221,7 +1224,7 @@ st.caption(
 )
 
 # --- Build sequence-level helper columns ---
-seq_eff = seq_summary.copy()
+seq_eff = seq_summary_all.copy()
 
 # Add thirds labels for starts/ends (always available from x coords)
 seq_eff["start_third"] = seq_eff["start_x"].apply(label_third_from_x) if "start_x" in seq_eff.columns else "Unknown"
@@ -1310,14 +1313,14 @@ seq_eff = seq_eff[seq_eff["end_third"].isin(end_third_choice)].copy()
 seq_eff = seq_eff[seq_eff["thirds_progressed_seq"] >= min_thirds_prog].copy()
 
 # Optional: filter by in-possession phase type if present (sequence-level best-effort)
-if "team_in_possession_phase_type" in dff.columns:
+if "team_in_possession_phase_type" in dff_all.columns:
     with st.sidebar:
-        phase_seq_opts = ["All"] + sorted([x for x in dff["team_in_possession_phase_type"].dropna().unique().tolist()])
+        phase_seq_opts = ["All"] + sorted([x for x in dff_all["team_in_possession_phase_type"].dropna().unique().tolist()])
         phase_seq_choice = st.selectbox("Phase (in-possession)", phase_seq_opts, index=0)
     if phase_seq_choice != "All":
         # Approx: keep sequences that contain at least one row with this phase type
         keep = (
-            dff[dff["team_in_possession_phase_type"] == phase_seq_choice][["match_id", "team_possession_seq"]]
+            dff_all[dff_all["team_in_possession_phase_type"] == phase_seq_choice][["match_id", "team_possession_seq"]]
             .dropna()
             .drop_duplicates()
         )
