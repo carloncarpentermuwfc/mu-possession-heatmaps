@@ -517,6 +517,8 @@ if zone_target != "None":
 dff, seq_warn = add_team_possession_sequence_id(dff)
 if seq_warn:
     st.warning(seq_warn)
+dff_all, _seq_warn_all = add_team_possession_sequence_id(dff_all)
+# We intentionally do not show _seq_warn_all to avoid duplicate warnings.
 
 
 # Teams after filtering
