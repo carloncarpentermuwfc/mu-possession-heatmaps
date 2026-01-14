@@ -136,6 +136,8 @@ def summarise_sequences(df: pd.DataFrame, team_col: str) -> pd.DataFrame:
     """
     One row per team possession sequence (match_id + team_possession_seq),
     with simple effectiveness proxies.
+
+    IMPORTANT: We build everything inside a single groupby.agg so indices align.
     """
     sort_cols = ["match_id", "team_possession_seq", "index"] if "index" in df.columns else ["match_id", "team_possession_seq", "frame_start"]
     d = df.sort_values(sort_cols).copy()
@@ -148,41 +150,49 @@ def summarise_sequences(df: pd.DataFrame, team_col: str) -> pd.DataFrame:
     def last(series):
         return series.iloc[-1]
 
-    out = gb.agg(
-        team=(team_col, first),
-        start_x=("x_start", first),
-        start_y=("y_start", first),
-        end_x=("x_end", last),
-        end_y=("y_end", last),
-        duration=("duration", "sum"),
-        n_player_possessions=("event_id", "size"),
-    )
+    agg_spec = {
+        "team": (team_col, first),
+        "start_x": ("x_start", first),
+        "start_y": ("y_start", first),
+        "end_x": ("x_end", last),
+        "end_y": ("y_end", last),
+        "duration": ("duration", "sum"),
+        "n_player_possessions": ("event_id", "size"),
+    }
 
-    # Optional: "lead_to_shot"/"lead_to_goal" are great outcome flags if present
+    # Optional outcome flags
     if "lead_to_shot" in d.columns:
-        out["lead_to_shot"] = gb["lead_to_shot"].max()
+        agg_spec["lead_to_shot"] = ("lead_to_shot", "max")
     else:
-        out["lead_to_shot"] = False
+        # Will fill after agg
+        pass
 
     if "lead_to_goal" in d.columns:
-        out["lead_to_goal"] = gb["lead_to_goal"].max()
-    else:
-        out["lead_to_goal"] = False
+        agg_spec["lead_to_goal"] = ("lead_to_goal", "max")
 
-    # End location categories if present
+    # Optional end-zone labels/flags (take last value in the sequence)
     if "third_end" in d.columns:
-        out["third_end"] = gb["third_end"].apply(lambda s: s.iloc[-1])
-    else:
-        out["third_end"] = np.nan
+        agg_spec["third_end"] = ("third_end", last)
 
     if "penalty_area_end" in d.columns:
-        out["penalty_area_end"] = gb["penalty_area_end"].apply(lambda s: s.iloc[-1])
-    else:
+        agg_spec["penalty_area_end"] = ("penalty_area_end", last)
+
+    out = gb.agg(**agg_spec)
+
+    # Ensure missing optional columns exist with sensible defaults
+    if "lead_to_shot" not in out.columns:
+        out["lead_to_shot"] = False
+    if "lead_to_goal" not in out.columns:
+        out["lead_to_goal"] = False
+    if "third_end" not in out.columns:
+        out["third_end"] = np.nan
+    if "penalty_area_end" not in out.columns:
         out["penalty_area_end"] = np.nan
 
     out["progression_x"] = out["end_x"] - out["start_x"]
     out["progression_abs_x"] = out["progression_x"].abs()
     return out
+
 
 
 # ----------------------------
