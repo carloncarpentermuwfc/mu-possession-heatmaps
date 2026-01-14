@@ -178,8 +178,13 @@ def summarise_sequences(df: pd.DataFrame, team_col: str) -> pd.DataFrame:
     with simple effectiveness proxies.
 
     IMPORTANT: We build everything inside a single groupby.agg so indices align.
+    We also sort rows within sequences using the best available time/order column.
     """
-    sort_cols = ["match_id", "team_possession_seq", "index"] if "index" in df.columns else ["match_id", "team_possession_seq", "frame_start"]
+    # Choose an order column that actually exists in this dataset
+    order_candidates = ["index", "frame_start", "time_start", "frame_end", "time_end", "event_id"]
+    order_col = next((c for c in order_candidates if c in df.columns), None)
+
+    sort_cols = ["match_id", "team_possession_seq"] + ([order_col] if order_col else [])
     d = df.sort_values(sort_cols).copy()
 
     gb = d.groupby(["match_id", "team_possession_seq"], as_index=False)
