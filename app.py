@@ -350,6 +350,42 @@ with st.sidebar:
             dff = dff[dff[half_col] == half_choice]
 
 # Add derived sequence id
+
+
+# Optional: zone filters (by thirds or custom rectangle)
+with st.sidebar:
+    st.subheader("Zone filter")
+    zone_target = st.selectbox(
+        "Apply zone filter to",
+        ["None", "Possession end location (x_end, y_end)", "Possession start location (x_start, y_start)"],
+        index=0,
+        help="Filters the underlying rows used for heatmaps, effectiveness, and player sections."
+    )
+
+    zone_mode = st.selectbox("Zone mode", ["Thirds", "Custom rectangle"], index=0)
+
+# Apply zone filter (if chosen)
+if zone_target != "None":
+    if "end location" in zone_target:
+        zx, zy = "x_end", "y_end"
+    else:
+        zx, zy = "x_start", "y_start"
+
+    # Ensure numeric
+    dff[zx] = pd.to_numeric(dff[zx], errors="coerce")
+    dff[zy] = pd.to_numeric(dff[zy], errors="coerce")
+
+    if zone_mode == "Thirds":
+        with st.sidebar:
+            third_choice = st.selectbox("Select third", ["Defensive", "Middle", "Attacking"])
+        dff["_zone_third"] = dff[zx].apply(label_third_from_x)
+        dff = dff[dff["_zone_third"] == third_choice].copy()
+    else:
+        with st.sidebar:
+            x_min, x_max = st.slider("x range", min_value=-52.5, max_value=52.5, value=(-52.5, 52.5), step=0.5)
+            y_min, y_max = st.slider("y range", min_value=-34.0, max_value=34.0, value=(-34.0, 34.0), step=0.5)
+        dff = dff[(dff[zx] >= x_min) & (dff[zx] <= x_max) & (dff[zy] >= y_min) & (dff[zy] <= y_max)].copy()
+
 dff, seq_warn = add_team_possession_sequence_id(dff)
 if seq_warn:
     st.warning(seq_warn)
@@ -677,6 +713,103 @@ else:
             ax.set_ylabel("Player")
             st.pyplot(fig, use_container_width=True)
             st.dataframe(topB, use_container_width=True, hide_index=True)
+
+
+
+
+# --- Player ball losses / turnovers ---
+st.subheader("Who loses the ball the most?")
+
+st.caption(
+    "This uses the best available loss/turnover indicator in your dataset. "
+    "If a dedicated turnover column isn't present, you may need to map event types to losses."
+)
+
+if player_col is None:
+    st.info("No player_name column found, so ball-loss analysis is unavailable.")
+else:
+    # Heuristic: pick a loss column if present
+    loss_candidates = [
+        "possession_lost", "lost_possession", "is_possession_lost",
+        "turnover", "is_turnover", "dispossessed", "is_dispossessed",
+        "ball_lost", "loss", "team_possession_loss_in_phase"
+    ]
+    loss_col = None
+    lower_cols = {c.lower(): c for c in dff.columns}
+    for cand in loss_candidates:
+        if cand in lower_cols:
+            loss_col = lower_cols[cand]
+            break
+
+    # Fallback: if event_type exists, look for common loss event labels
+    event_col = None
+    for cand in ["event_type", "type", "event_name"]:
+        if cand in dff.columns:
+            event_col = cand
+            break
+
+    dd_loss = dff[dff[team_col].isin([left_team, right_team])].copy()
+    dd_loss = dd_loss.dropna(subset=[player_col])
+
+    if loss_col is not None:
+        # Convert to boolean-ish
+        loss_flag = dd_loss[loss_col].fillna(False)
+        if loss_flag.dtype != bool:
+            # handle strings like "True"/"False"
+            loss_flag = loss_flag.astype(str).str.lower().isin(["true", "1", "yes", "y"])
+        dd_loss["_loss_flag"] = loss_flag
+        loss_source = f"Using column `{loss_col}` as the loss indicator."
+    elif event_col is not None:
+        # Basic mapping of event strings
+        ev = dd_loss[event_col].astype(str).str.lower()
+        dd_loss["_loss_flag"] = ev.str.contains("turnover|dispossess|miscontrol|lost|intercepted", regex=True)
+        loss_source = f"No explicit loss column found; using keyword match on `{event_col}`."
+    else:
+        dd_loss["_loss_flag"] = False
+        loss_source = "No loss indicator found (no suitable columns)."
+
+    st.info(loss_source)
+
+    def player_losses(team_name: str) -> pd.DataFrame:
+        t = dd_loss[dd_loss[team_col] == team_name].copy()
+        out = (
+            t.groupby(player_col, as_index=False)
+            .agg(
+                player_possessions=(player_col, "size"),
+                ball_losses=("_loss_flag", "sum"),
+            )
+            .rename(columns={player_col: "player"})
+        )
+        out["loss_rate"] = out["ball_losses"] / out["player_possessions"]
+        out = out.sort_values(["ball_losses", "loss_rate"], ascending=False)
+        return out
+
+    l1, l2 = st.columns(2)
+    with l1:
+        st.markdown(f"**{left_team} – most ball losses**")
+        LA = player_losses(left_team).head(15)
+        if len(LA) == 0:
+            st.info("No player possessions under current filters.")
+        else:
+            fig, ax = plt.subplots(figsize=(7, 4.5))
+            ax.barh(LA["player"][::-1], LA["ball_losses"][::-1])
+            ax.set_xlabel("Ball losses")
+            ax.set_ylabel("Player")
+            st.pyplot(fig, use_container_width=True)
+            st.dataframe(LA, use_container_width=True, hide_index=True)
+
+    with l2:
+        st.markdown(f"**{right_team} – most ball losses**")
+        LB = player_losses(right_team).head(15)
+        if len(LB) == 0:
+            st.info("No player possessions under current filters.")
+        else:
+            fig, ax = plt.subplots(figsize=(7, 4.5))
+            ax.barh(LB["player"][::-1], LB["ball_losses"][::-1])
+            ax.set_xlabel("Ball losses")
+            ax.set_ylabel("Player")
+            st.pyplot(fig, use_container_width=True)
+            st.dataframe(LB, use_container_width=True, hide_index=True)
 
 
 st.subheader("Which players combine the most? (pass links)")
