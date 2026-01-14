@@ -330,6 +330,7 @@ with st.sidebar:
     selected_matches = st.multiselect("Match(es)", match_ids, default=match_ids)
 
 dff = df[df["match_id"].isin(selected_matches)].copy()
+dff_all = dff.copy()  # snapshot before any team-scope filtering
 
 # Optional filters (phase and half)
 with st.sidebar:
@@ -511,7 +512,6 @@ if zone_target != "None":
 dff, seq_warn = add_team_possession_sequence_id(dff)
 if seq_warn:
     st.warning(seq_warn)
-dff_all = dff.copy()  # snapshot before Team A/Team B scope filtering (used for all-teams dashboards)
 
 
 # Teams after filtering
