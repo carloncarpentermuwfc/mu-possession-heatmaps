@@ -1234,7 +1234,7 @@ with st.sidebar:
 
     # Team selection for this section
     eff_teams = st.multiselect("Teams to include (effectiveness)", sorted(seq_eff["team"].dropna().unique().tolist()),
-                              default=eff_teams_all if str(left_team) in seq_eff["team"].astype(str).unique() else None)
+                              default=eff_teams_all).unique() else None)
 
     # Game state / score filters if present
     gs_col = None
@@ -1357,100 +1357,127 @@ kpi1.metric("Teams in view", int(team_tbl["team"].nunique()) if len(team_tbl) el
 kpi2.metric("Sequences in view", int(seq_eff.shape[0]))
 kpi3.metric("Avg thirds progressed (all)", f"{seq_eff['thirds_progressed_seq'].mean():.2f}" if len(seq_eff) else "—")
 
-st.dataframe(team_tbl, use_container_width=True, hide_index=True)
+tabs = st.tabs(["Overview", "Shot & territory", "Progression & tempo", "Start vs end geography"])
 
-# --- Charts: compare teams ---
-if len(team_tbl) > 0:
-    st.subheader("Team comparison charts")
+with tabs[0]:
+    st.subheader("Team effectiveness table")
+    st.dataframe(team_tbl, use_container_width=True, hide_index=True)
 
-    metric_options = [
-        ("shot_rate", "Shot rate"),
-        ("goal_rate", "Goal rate"),
-        ("avg_duration", "Avg duration"),
-        ("avg_x_prog", "Avg x progression"),
-        ("avg_thirds_progressed", "Avg thirds progressed"),
-        ("end_final_third_rate", "End in final third rate"),
-        ("end_pen_area_rate", "End in penalty area rate"),
-    ]
-    available_metrics = [(k, lbl) for k, lbl in metric_options if k in team_tbl.columns and team_tbl[k].notna().any()]
-    metric_sel = st.selectbox("Metric", available_metrics, format_func=lambda x: x[1])
-    metric_key, metric_label = metric_sel[0], metric_sel[1]
+    if len(team_tbl) == 0:
+        st.info("No sequences available under current effectiveness filters.")
+    else:
+        st.subheader("Quick leaderboard")
+        metric_key = st.selectbox(
+            "Leaderboard metric",
+            ["shot_rate", "goal_rate", "avg_duration", "avg_x_prog", "avg_thirds_progressed"],
+            index=0,
+        )
+        metric_label_map = {
+            "shot_rate": "Shot rate",
+            "goal_rate": "Goal rate",
+            "avg_duration": "Avg duration",
+            "avg_x_prog": "Avg x progression",
+            "avg_thirds_progressed": "Avg thirds progressed",
+        }
+        metric_label = metric_label_map.get(metric_key, metric_key)
 
-    # Bar chart
-    fig, ax = plt.subplots(figsize=(10, 5))
-    plot_df = team_tbl.sort_values(metric_key, ascending=False).copy()
-    ax.bar(plot_df["team"].astype(str), plot_df[metric_key].astype(float))
-    ax.set_title(f"Teams by {metric_label}")
-    ax.set_ylabel(metric_label)
-    ax.set_xticklabels(plot_df["team"].astype(str), rotation=20, ha="right")
-    st.pyplot(fig, use_container_width=True)
+        fig, ax = plt.subplots(figsize=(10, 5))
+        plot_df = team_tbl.sort_values(metric_key, ascending=False).copy()
+        ax.bar(plot_df["team"].astype(str), plot_df[metric_key].astype(float))
+        ax.set_title(f"Teams by {metric_label}")
+        ax.set_ylabel(metric_label)
+        ax.set_xticklabels(plot_df["team"].astype(str), rotation=20, ha="right")
+        st.pyplot(fig, use_container_width=True)
 
-    # Distribution by team (top 2 only for readability)
-    # Some selected metrics are team-level aggregates (e.g., shot_rate) and don't exist as raw sequence columns.
-    # Map them back to an underlying sequence column (or a derived boolean) for distributions.
-    dist_source = metric_key
-    if metric_key == "shot_rate":
-        dist_source = "lead_to_shot"
-    elif metric_key == "goal_rate":
-        dist_source = "lead_to_goal"
-    elif metric_key == "end_final_third_rate":
-        dist_source = "__end_final_third__"
-    elif metric_key == "end_pen_area_rate":
-        dist_source = "__end_pen_area__"
-
-    top2 = plot_df["team"].astype(str).head(2).tolist()
-    if len(top2) == 2:
-        # Build vectors safely
-        def seq_vector(team_name: str):
-            s = seq_eff[seq_eff["team"].astype(str) == team_name].copy()
-            if dist_source in s.columns:
-                return pd.to_numeric(s[dist_source], errors="coerce").dropna().astype(float).values
-            if dist_source == "__end_final_third__":
-                if "third_end" in s.columns:
-                    v = s["third_end"].astype(str).str.contains("attacking", case=False, na=False).astype(float).values
-                    return v
-                return np.array([])
-            if dist_source == "__end_pen_area__":
-                if "penalty_area_end" in s.columns:
-                    v = s["penalty_area_end"].fillna(False).astype(bool).astype(float).values
-                    return v
-                return np.array([])
-            return np.array([])
-
-        a = seq_vector(top2[0])
-        b = seq_vector(top2[1])
-
-        if len(a) > 0 and len(b) > 0:
+with tabs[1]:
+    st.subheader("Shot & territory")
+    if len(team_tbl) == 0:
+        st.info("No sequences available under current effectiveness filters.")
+    else:
+        # Shot / goal rates + territory proxies (final third / box if available)
+        cols = st.columns(2)
+        with cols[0]:
             fig, ax = plt.subplots(figsize=(10, 4.5))
-            ax.hist(a, bins=30, alpha=0.6, label=top2[0])
-            ax.hist(b, bins=30, alpha=0.6, label=top2[1])
-            ax.set_title(f"Distribution of {metric_label}: {top2[0]} vs {top2[1]}")
-            ax.set_xlabel(metric_label)
-            ax.set_ylabel("Count")
-            ax.legend()
+            plot_df = team_tbl.sort_values("shot_rate", ascending=False).copy()
+            ax.bar(plot_df["team"].astype(str), plot_df["shot_rate"].astype(float))
+            ax.set_title("Shot rate by team")
+            ax.set_ylabel("Shot rate")
+            ax.set_xticklabels(plot_df["team"].astype(str), rotation=20, ha="right")
             st.pyplot(fig, use_container_width=True)
+
+        with cols[1]:
+            fig, ax = plt.subplots(figsize=(10, 4.5))
+            plot_df = team_tbl.sort_values("goal_rate", ascending=False).copy()
+            ax.bar(plot_df["team"].astype(str), plot_df["goal_rate"].astype(float))
+            ax.set_title("Goal rate by team")
+            ax.set_ylabel("Goal rate")
+            ax.set_xticklabels(plot_df["team"].astype(str), rotation=20, ha="right")
+            st.pyplot(fig, use_container_width=True)
+
+        # Territory: end in final third / penalty area (if available)
+        terr_cols = [c for c in ["end_final_third_rate", "end_pen_area_rate"] if c in team_tbl.columns and team_tbl[c].notna().any()]
+        if terr_cols:
+            for c in terr_cols:
+                fig, ax = plt.subplots(figsize=(10, 4.5))
+                plot_df = team_tbl.sort_values(c, ascending=False).copy()
+                ax.bar(plot_df["team"].astype(str), plot_df[c].astype(float))
+                ax.set_title(f"{c.replace('_', ' ').title()} by team")
+                ax.set_ylabel("Rate")
+                ax.set_xticklabels(plot_df["team"].astype(str), rotation=20, ha="right")
+                st.pyplot(fig, use_container_width=True)
         else:
-            st.info("Distribution view isn't available for this metric under current filters.")
+            st.info("Territory end-zone rates not available in this dataset/filters.")
 
-    # Start vs end common areas (quick view)
-    st.subheader("Start vs end areas for filtered sequences")
-    tcols = st.columns(2)
-    with tcols[0]:
-        fig, ax = plt.subplots(figsize=(8, 5))
-        img = plot_kde(ax, seq_eff["start_x"].dropna().values, seq_eff["start_y"].dropna().values)
-        ax.set_title("START locations (filtered sequences)")
-        if img is not None:
-            plt.colorbar(img, ax=ax, fraction=0.046, pad=0.04)
+with tabs[2]:
+    st.subheader("Progression & tempo")
+    if len(team_tbl) == 0:
+        st.info("No sequences available under current effectiveness filters.")
+    else:
+        cols = st.columns(2)
+        with cols[0]:
+            fig, ax = plt.subplots(figsize=(10, 4.5))
+            plot_df = team_tbl.sort_values("avg_x_prog", ascending=False).copy()
+            ax.bar(plot_df["team"].astype(str), plot_df["avg_x_prog"].astype(float))
+            ax.set_title("Average x progression by team")
+            ax.set_ylabel("Avg x progression")
+            ax.set_xticklabels(plot_df["team"].astype(str), rotation=20, ha="right")
+            st.pyplot(fig, use_container_width=True)
+
+        with cols[1]:
+            fig, ax = plt.subplots(figsize=(10, 4.5))
+            plot_df = team_tbl.sort_values("avg_duration", ascending=False).copy()
+            ax.bar(plot_df["team"].astype(str), plot_df["avg_duration"].astype(float))
+            ax.set_title("Average sequence duration by team")
+            ax.set_ylabel("Seconds")
+            ax.set_xticklabels(plot_df["team"].astype(str), rotation=20, ha="right")
+            st.pyplot(fig, use_container_width=True)
+
+        fig, ax = plt.subplots(figsize=(10, 4.5))
+        plot_df = team_tbl.sort_values("avg_thirds_progressed", ascending=False).copy()
+        ax.bar(plot_df["team"].astype(str), plot_df["avg_thirds_progressed"].astype(float))
+        ax.set_title("Average thirds progressed by team")
+        ax.set_ylabel("Thirds progressed (avg)")
+        ax.set_xticklabels(plot_df["team"].astype(str), rotation=20, ha="right")
         st.pyplot(fig, use_container_width=True)
-    with tcols[1]:
-        fig, ax = plt.subplots(figsize=(8, 5))
-        img = plot_kde(ax, seq_eff["end_x"].dropna().values, seq_eff["end_y"].dropna().values)
-        ax.set_title("END locations (filtered sequences)")
-        if img is not None:
-            plt.colorbar(img, ax=ax, fraction=0.046, pad=0.04)
-        st.pyplot(fig, use_container_width=True)
-else:
-    st.info("No sequences available under current effectiveness filters.")
 
+with tabs[3]:
+    st.subheader("Start vs end geography (filtered sequences)")
+    if len(seq_eff) < 2:
+        st.info("Not enough sequences under current filters to draw KDE maps.")
+    else:
+        tcols = st.columns(2)
+        with tcols[0]:
+            fig, ax = plt.subplots(figsize=(8, 5))
+            img = plot_kde(ax, seq_eff["start_x"].dropna().values, seq_eff["start_y"].dropna().values)
+            ax.set_title("START locations (all selected teams)")
+            if img is not None:
+                plt.colorbar(img, ax=ax, fraction=0.046, pad=0.04)
+            st.pyplot(fig, use_container_width=True)
 
-
+        with tcols[1]:
+            fig, ax = plt.subplots(figsize=(8, 5))
+            img = plot_kde(ax, seq_eff["end_x"].dropna().values, seq_eff["end_y"].dropna().values)
+            ax.set_title("END locations (all selected teams)")
+            if img is not None:
+                plt.colorbar(img, ax=ax, fraction=0.046, pad=0.04)
+            st.pyplot(fig, use_container_width=True)
