@@ -70,6 +70,45 @@ def draw_pitch(ax):
     ax.set_ylim(-37, 37)
     ax.axis("off")
 
+# ----------------------------
+# Thirds helpers (based on x coordinate)
+# ----------------------------
+def label_third_from_x(x: float) -> str:
+    """
+    Splits the pitch length (-52.5 to 52.5) into 3 equal thirds using boundaries at -17.5 and 17.5.
+    Defensive: x < -17.5
+    Middle:    -17.5 <= x <= 17.5
+    Attacking: x > 17.5
+    """
+    if pd.isna(x):
+        return "Unknown"
+    if x < -17.5:
+        return "Defensive"
+    if x > 17.5:
+        return "Attacking"
+    return "Middle"
+
+
+def thirds_progressed(start_x: float, end_x: float) -> int:
+    """
+    Counts how many thirds a possession moves through, ignoring directionality:
+    Defensive -> Middle = 1
+    Middle -> Attacking = 1
+    Defensive -> Attacking = 2
+    Otherwise = 0
+    """
+    s = label_third_from_x(start_x)
+    e = label_third_from_x(end_x)
+    if "Unknown" in (s, e):
+        return 0
+    mapping = {
+        ("Defensive", "Middle"): 1,
+        ("Middle", "Attacking"): 1,
+        ("Defensive", "Attacking"): 2,
+    }
+    return mapping.get((s, e), 0)
+
+
 
 # ----------------------------
 # Aggregation helpers
@@ -393,6 +432,45 @@ with colB:
     st.pyplot(fig, use_container_width=True)
 
 # --- Effectiveness comparisons ---
+
+
+# --- Where possessions start and end (common areas) ---
+st.subheader("Most common areas for possessions to start vs end")
+
+st.caption(
+    "These plots use **team possession sequences** (one per sequence). "
+    "Start = first location in the sequence, End = last location in the sequence."
+)
+
+team_for_zones = st.radio("Team for start/end zones", [str(left_team), str(right_team), "Both"], horizontal=True)
+
+def plot_start_end_for_team(team_name: str):
+    seq = seq_summary[seq_summary["team"] == team_name].dropna(subset=["start_x", "start_y", "end_x", "end_y"])
+    c1, c2 = st.columns(2)
+    with c1:
+        fig, ax = plt.subplots(figsize=(7.5, 5))
+        img = plot_kde(ax, seq["start_x"].values, seq["start_y"].values)
+        ax.set_title(f"{team_name} – Sequence START locations (KDE)")
+        if img is not None:
+            plt.colorbar(img, ax=ax, fraction=0.046, pad=0.04)
+        st.pyplot(fig, use_container_width=True)
+    with c2:
+        fig, ax = plt.subplots(figsize=(7.5, 5))
+        img = plot_kde(ax, seq["end_x"].values, seq["end_y"].values)
+        ax.set_title(f"{team_name} – Sequence END locations (KDE)")
+        if img is not None:
+            plt.colorbar(img, ax=ax, fraction=0.046, pad=0.04)
+        st.pyplot(fig, use_container_width=True)
+
+if team_for_zones == "Both":
+    t1, t2 = st.tabs([str(left_team), str(right_team)])
+    with t1:
+        plot_start_end_for_team(str(left_team))
+    with t2:
+        plot_start_end_for_team(str(right_team))
+else:
+    plot_start_end_for_team(team_for_zones)
+
 st.subheader("Effectiveness of possession sequences (simple comparisons)")
 
 def safe_mean(s):
@@ -537,6 +615,70 @@ else:
         st.dataframe(topB, use_container_width=True, hide_index=True)
 
 # --- Player combinations (passing links) ---
+
+
+# --- Player ball progression value (through thirds) ---
+st.subheader("Who adds the most ball progression through the thirds?")
+
+st.caption(
+    "Simple 'value' proxy: counts how often a player moves the ball from Defensive→Middle, Middle→Attacking (1 each), "
+    "or Defensive→Attacking (2). Boundaries are x=-17.5 and x=17.5 in your coordinate system."
+)
+
+if player_col is None:
+    st.info("No player_name column found, so progression-by-player is unavailable.")
+else:
+    def player_third_progression(team_name: str) -> pd.DataFrame:
+        dd = dff[dff[team_col] == team_name].dropna(subset=[player_col, "x_start", "y_start", "x_end", "y_end"]).copy()
+        dd["start_third"] = dd["x_start"].apply(label_third_from_x)
+        dd["end_third"] = dd["x_end"].apply(label_third_from_x)
+        dd["thirds_progressed"] = [thirds_progressed(s, e) for s, e in zip(dd["x_start"], dd["x_end"])]
+        dd["dx"] = (dd["x_end"] - dd["x_start"])
+
+        out = (
+            dd.groupby(player_col, as_index=False)
+            .agg(
+                player_possessions=(player_col, "size"),
+                thirds_progressed=("thirds_progressed", "sum"),
+                avg_thirds_progressed=("thirds_progressed", "mean"),
+                total_x_progression=("dx", "sum"),
+                avg_x_progression=("dx", "mean"),
+            )
+            .rename(columns={player_col: "player"})
+            .sort_values("thirds_progressed", ascending=False)
+        )
+        return out
+
+    pr1, pr2 = st.columns(2)
+    with pr1:
+        st.markdown(f"**Top ball progressors – {left_team}**")
+        progA = player_third_progression(left_team)
+        topA = progA.head(12)
+        if len(topA) == 0:
+            st.info("No player possessions under current filters.")
+        else:
+            fig, ax = plt.subplots(figsize=(7, 4.5))
+            ax.barh(topA["player"][::-1], topA["thirds_progressed"][::-1])
+            ax.set_xlabel("Total thirds progressed (proxy)")
+            ax.set_ylabel("Player")
+            st.pyplot(fig, use_container_width=True)
+            st.dataframe(topA, use_container_width=True, hide_index=True)
+
+    with pr2:
+        st.markdown(f"**Top ball progressors – {right_team}**")
+        progB = player_third_progression(right_team)
+        topB = progB.head(12)
+        if len(topB) == 0:
+            st.info("No player possessions under current filters.")
+        else:
+            fig, ax = plt.subplots(figsize=(7, 4.5))
+            ax.barh(topB["player"][::-1], topB["thirds_progressed"][::-1])
+            ax.set_xlabel("Total thirds progressed (proxy)")
+            ax.set_ylabel("Player")
+            st.pyplot(fig, use_container_width=True)
+            st.dataframe(topB, use_container_width=True, hide_index=True)
+
+
 st.subheader("Which players combine the most? (pass links)")
 
 target_col = "player_targeted_name" if "player_targeted_name" in dff.columns else None
@@ -612,7 +754,9 @@ else:
         st.header("Network settings")
         min_link_weight = st.slider("Minimum links to show", min_value=1, max_value=20, value=3, step=1)
         top_edges = st.slider("Max edges to draw", min_value=10, max_value=200, value=60, step=10)
-        layout_choice = st.selectbox("Layout", ["spring", "circular"], index=0)
+        overlay_on_pitch = st.checkbox("Overlay network on pitch", value=True)
+        loc_mode = st.selectbox("Player location", ["avg start location", "avg midpoint (start/end)"], index=0)
+        fallback_layout = st.selectbox("Fallback layout (if no locations)", ["spring", "circular"], index=0)
 
     try:
         import networkx as nx
@@ -623,7 +767,7 @@ else:
     if not NX_OK:
         st.info("networkx is not installed (needed for passing networks). Install it via requirements.txt.")
     else:
-        def build_pass_graph(team_name: str):
+        def build_pass_links(team_name: str) -> pd.DataFrame:
             dd = dff[dff[team_col] == team_name].copy()
             dd = dd.dropna(subset=[player_col, target_col])
 
@@ -640,15 +784,30 @@ else:
                 .sort_values("w", ascending=False)
             )
 
-            # Filter + cap edges
             links = links[links["w"] >= min_link_weight].head(top_edges)
+            return links
 
+        def build_positions(team_name: str) -> dict:
+            dd = dff[dff[team_col] == team_name].copy()
+            dd = dd.dropna(subset=[player_col, "x_start", "y_start", "x_end", "y_end"])
+
+            if loc_mode == "avg midpoint (start/end)":
+                dd["px"] = (dd["x_start"] + dd["x_end"]) / 2.0
+                dd["py"] = (dd["y_start"] + dd["y_end"]) / 2.0
+            else:
+                dd["px"] = dd["x_start"]
+                dd["py"] = dd["y_start"]
+
+            pos_df = dd.groupby(player_col)[["px", "py"]].mean().reset_index()
+            return {str(r[player_col]): (float(r["px"]), float(r["py"])) for _, r in pos_df.iterrows()}
+
+        def links_to_graph(links: pd.DataFrame) -> nx.DiGraph:
             G = nx.DiGraph()
             for _, r in links.iterrows():
                 G.add_edge(str(r["from"]), str(r["to"]), weight=float(r["w"]))
-            return G, links
+            return G
 
-        def draw_graph(ax, G, title: str):
+        def draw_layout_graph(ax, G, title: str, layout: str):
             ax.axis("off")
             ax.set_title(title)
 
@@ -656,13 +815,11 @@ else:
                 ax.text(0.5, 0.5, "No links under current filters", ha="center", va="center")
                 return
 
-            if layout_choice == "circular":
+            if layout == "circular":
                 pos = nx.circular_layout(G)
             else:
-                # spring layout with fixed seed for stability
                 pos = nx.spring_layout(G, seed=7, k=0.7)
 
-            # Node sizes: total involvement (in+out degree weighted)
             node_strength = {}
             for n in G.nodes():
                 out_w = sum(d.get("weight", 1.0) for _, _, d in G.out_edges(n, data=True))
@@ -670,10 +827,8 @@ else:
                 node_strength[n] = out_w + in_w
 
             strengths = np.array([node_strength[n] for n in G.nodes()], dtype=float)
-            # Scale sizes nicely
             sizes = 300 + 1200 * (strengths / strengths.max()) if strengths.max() > 0 else 400
 
-            # Edge widths proportional to weight
             weights = np.array([d.get("weight", 1.0) for _, _, d in G.edges(data=True)], dtype=float)
             widths = 0.5 + 4.0 * (weights / weights.max()) if weights.max() > 0 else 1.0
 
@@ -681,23 +836,86 @@ else:
             nx.draw_networkx_edges(G, pos, ax=ax, width=widths, arrows=True, arrowsize=12, alpha=0.6)
             nx.draw_networkx_labels(G, pos, ax=ax, font_size=9)
 
-        netA, linksA = build_pass_graph(left_team)
-        netB, linksB = build_pass_graph(right_team)
+        def draw_pitch_overlay(ax, G, positions: dict, title: str):
+            draw_pitch(ax)
+            ax.set_title(title)
+
+            if G.number_of_nodes() == 0 or G.number_of_edges() == 0:
+                ax.text(0, 0, "No links under current filters", ha="center", va="center")
+                return
+
+            # Keep only nodes that have positions
+            nodes_with_pos = {n for n in G.nodes() if n in positions}
+            if len(nodes_with_pos) < 2:
+                ax.text(0, 0, "Not enough player locations (try changing Player location setting)", ha="center", va="center")
+                return
+
+            # Node strength for sizing
+            node_strength = {}
+            for n in nodes_with_pos:
+                out_w = sum(d.get("weight", 1.0) for _, _, d in G.out_edges(n, data=True) if _ in nodes_with_pos or True)
+                in_w = sum(d.get("weight", 1.0) for _, _, d in G.in_edges(n, data=True) if _ in nodes_with_pos or True)
+                node_strength[n] = out_w + in_w
+
+            strengths = np.array([node_strength[n] for n in nodes_with_pos], dtype=float)
+            sizes = 80 + 520 * (strengths / strengths.max()) if strengths.max() > 0 else 200
+
+            # Edge widths
+            edges = [(u, v, d.get("weight", 1.0)) for u, v, d in G.edges(data=True) if u in nodes_with_pos and v in nodes_with_pos]
+            if not edges:
+                ax.text(0, 0, "No edges with player locations", ha="center", va="center")
+                return
+
+            weights = np.array([w for _, _, w in edges], dtype=float)
+            widths = 0.3 + 3.0 * (weights / weights.max()) if weights.max() > 0 else 1.0
+
+            # Draw edges as arrows
+            for (u, v, w), lw in zip(edges, widths):
+                x1, y1 = positions[u]
+                x2, y2 = positions[v]
+                ax.annotate(
+                    "",
+                    xy=(x2, y2),
+                    xytext=(x1, y1),
+                    arrowprops=dict(arrowstyle="->", lw=lw, alpha=0.55),
+                )
+
+            # Draw nodes + labels
+            xs = [positions[n][0] for n in nodes_with_pos]
+            ys = [positions[n][1] for n in nodes_with_pos]
+            ax.scatter(xs, ys, s=sizes, alpha=0.9)
+
+            for n in nodes_with_pos:
+                x, y = positions[n]
+                ax.text(x, y, n, fontsize=8, ha="center", va="center")
+
+        def make_team_network(team_name: str):
+            links = build_pass_links(team_name)
+            G = links_to_graph(links)
+            pos = build_positions(team_name) if overlay_on_pitch else {}
+            return G, links, pos
+
+        netA, linksA, posA = make_team_network(left_team)
+        netB, linksB, posB = make_team_network(right_team)
 
         n1, n2 = st.columns(2)
         with n1:
             fig, ax = plt.subplots(figsize=(7, 6))
-            draw_graph(ax, netA, f"{left_team} passing network (filtered)")
+            if overlay_on_pitch:
+                draw_pitch_overlay(ax, netA, posA, f"{left_team} passing network (pitch overlay)")
+            else:
+                draw_layout_graph(ax, netA, f"{left_team} passing network", layout=fallback_layout)
             st.pyplot(fig, use_container_width=True)
-
             with st.expander("Show edges table"):
                 st.dataframe(linksA, use_container_width=True, hide_index=True)
 
         with n2:
             fig, ax = plt.subplots(figsize=(7, 6))
-            draw_graph(ax, netB, f"{right_team} passing network (filtered)")
+            if overlay_on_pitch:
+                draw_pitch_overlay(ax, netB, posB, f"{right_team} passing network (pitch overlay)")
+            else:
+                draw_layout_graph(ax, netB, f"{right_team} passing network", layout=fallback_layout)
             st.pyplot(fig, use_container_width=True)
-
             with st.expander("Show edges table"):
                 st.dataframe(linksB, use_container_width=True, hide_index=True)
 
