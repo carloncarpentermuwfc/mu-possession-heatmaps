@@ -359,44 +359,51 @@ with st.sidebar:
     BASE_DIR = os.path.dirname(__file__)
     DATA_DIR = os.path.join(BASE_DIR, "data")
 
-    # Prefer a sensible default filename if present
-    candidate_defaults = [
-        os.path.join(DATA_DIR, "MUWFCPOSSESSIONS.csv"),
-        os.path.join(DATA_DIR, "possessions.csv"),
-        os.path.join(DATA_DIR, "data.csv"),
-    ]
-    default_path = next((p for p in candidate_defaults if os.path.exists(p)), candidate_defaults[0])
+    st.caption("This app auto-loads data from the repo /data folder (recommended). Upload is only a fallback.")
 
-    mode = st.radio(
-        "Load mode",
-        ["Use repo data (recommended)", "Upload CSV"],
-        index=0,
-        horizontal=True,
-    )
+    uploaded = st.file_uploader("Upload possessions CSV (fallback only)", type=["csv"])
 
-    repo_files = []
-    if os.path.isdir(DATA_DIR):
-        repo_files = sorted([f for f in os.listdir(DATA_DIR) if f.lower().endswith(".csv")])
+# --- Auto-load possessions dataset from repo ---
+BASE_DIR = os.path.dirname(__file__)
+DATA_DIR = os.path.join(BASE_DIR, "data")
 
-    if mode == "Use repo data (recommended)":
-        if not repo_files:
-            st.warning("No CSV files found in the repo /data folder.")
-            selected_repo_file = None
-        else:
-            # Default selection: whichever matches default_path if possible
-            default_name = os.path.basename(default_path)
-            default_idx = repo_files.index(default_name) if default_name in repo_files else 0
-            selected_repo_file = st.selectbox("Choose a CSV from /data", repo_files, index=default_idx)
+# Prefer explicit known filename first
+preferred = os.path.join(DATA_DIR, "MUWFCPOSSESSIONS.csv")
 
-        uploaded = None
-    else:
-        selected_repo_file = None
-        uploaded = st.file_uploader("Upload CSV", type=["csv"])
+def _is_player_value_table(name: str) -> bool:
+    n = name.lower()
+    return any(k in n for k in [
+        "top_progression",
+        "top_chance_creators",
+        "role-adjusted",
+        "net_negative",
+        "attacking_value",
+        "xA".lower(),
+        "xT".lower(),
+    ])
 
-if mode == "Use repo data (recommended)":
-    if selected_repo_file is None:
-        st.info("Add your CSV to the repo under /data, then refresh.")
-        st.stop()
+repo_csvs = []
+if os.path.isdir(DATA_DIR):
+    repo_csvs = [f for f in os.listdir(DATA_DIR) if f.lower().endswith(".csv")]
+
+possessions_path = None
+if os.path.exists(preferred):
+    possessions_path = preferred
+else:
+    # Choose the largest CSV in /data that is NOT one of the player value tables
+    candidates = [f for f in repo_csvs if not _is_player_value_table(f)]
+    if candidates:
+        sizes = [(os.path.getsize(os.path.join(DATA_DIR, f)), f) for f in candidates]
+        sizes.sort(reverse=True)
+        possessions_path = os.path.join(DATA_DIR, sizes[0][1])
+
+if possessions_path is not None:
+    df = load_from_path(possessions_path)
+elif uploaded is not None:
+    df = load_possessions(uploaded.getvalue())
+else:
+    st.error("No possessions CSV found. Add MUWFCPOSSESSIONS.csv (recommended) to the repo /data folder, or upload a CSV in the sidebar.")
+    st.stop()
     df = load_from_path(os.path.join(DATA_DIR, selected_repo_file))
 elif uploaded is not None:
     df = load_possessions(uploaded.getvalue())
@@ -822,6 +829,29 @@ with dist_col2:
     st.pyplot(fig, use_container_width=True)
 
 # --- Player involvement ---
+
+
+# --- Data status (auto-loaded from /data) ---
+with st.sidebar.expander("Data status", expanded=False):
+    st.write("Possessions CSV:", os.path.basename(possessions_path) if "possessions_path" in globals() and possessions_path else "Uploaded / not found")
+    st.write("Possessions rows:", int(df.shape[0]) if "df" in globals() and hasattr(df, "shape") else "—")
+
+    def _status_one(label: str, rel_path: str):
+        p = os.path.join(os.path.dirname(__file__), rel_path)
+        if os.path.exists(p):
+            try:
+                tmp = pd.read_csv(p)
+                st.write(f"{label}: ✅ ({tmp.shape[0]} rows)")
+            except Exception:
+                st.write(f"{label}: ⚠️ (found, but couldn't read)")
+        else:
+            st.write(f"{label}: ❌ (missing)")
+
+    _status_one("xT table", "data/Top_progression__xT__per_100_possessions.csv")
+    _status_one("xA table", "data/Top_chance_creators__xA__per_100_possessions.csv")
+    _status_one("Best role-adjusted", "data/Best_role-adjusted_attacking_value__per_100_possessions_.csv")
+    _status_one("Worst role-adjusted", "data/Worst_role-adjusted_attacking_value__per_100_possessions_.csv")
+    _status_one("Net negative value", "data/Net_negative_total_attacking_value__sample_filtered_.csv")
 
 # ============================================================
 # Advanced effectiveness dashboard (filters + multi-team charts)
