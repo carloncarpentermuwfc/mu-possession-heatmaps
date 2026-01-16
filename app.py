@@ -378,8 +378,8 @@ def _is_player_value_table(name: str) -> bool:
         "role-adjusted",
         "net_negative",
         "attacking_value",
-        "xA".lower(),
-        "xT".lower(),
+        "xa",
+        "xt",
     ])
 
 repo_csvs = []
@@ -390,7 +390,6 @@ possessions_path = None
 if os.path.exists(preferred):
     possessions_path = preferred
 else:
-    # Choose the largest CSV in /data that is NOT one of the player value tables
     candidates = [f for f in repo_csvs if not _is_player_value_table(f)]
     if candidates:
         sizes = [(os.path.getsize(os.path.join(DATA_DIR, f)), f) for f in candidates]
@@ -402,7 +401,10 @@ if possessions_path is not None:
 elif uploaded is not None:
     df = load_possessions(uploaded.getvalue())
 else:
-    st.error("No possessions CSV found. Add MUWFCPOSSESSIONS.csv (recommended) to the repo /data folder, or upload a CSV in the sidebar.")
+    st.error(
+        "No possessions CSV found. Add MUWFCPOSSESSIONS.csv to the repo /data folder "
+        "or upload a CSV in the sidebar."
+    )
     st.stop()
     df = load_from_path(os.path.join(DATA_DIR, selected_repo_file))
 elif uploaded is not None:
