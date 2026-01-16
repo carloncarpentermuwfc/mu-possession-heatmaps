@@ -1,723 +1,1771 @@
-
-# app.py
-# Streamlit: Crossing Dashboard + Full Team Comparison + Possession Effectiveness (inferred possessions)
-#
-# What you get (all requested):
-# - Crossing pitch map (your existing Plotly pitch code stays, with filters)
-# - Team-by-team comparison charts
-# - Possession sequence effectiveness (inferred possessions)
-# - Speed vs Control (passes per possession, duration)
-# - Directness (meters progressed per possession)
-# - Crossing-possession effectiveness toggle
-# - Counter-attack detection (heuristic) + team comparison
-# - Possession outcome breakdown (stacked bars)
-# - Possession flow Sankey (build → cross → box entry → shot / turnover)
-# - Percentile ranks table (league-wide)
-# - Match-state filtering (if score columns exist; otherwise hidden)
-# - Download buttons for filtered data + team tables
-#
-# Requirements (requirements.txt):
-#   streamlit
-#   pandas
-#   numpy
-#   plotly
-#
-# If you see "No module named plotly", add plotly to requirements.txt and redeploy / clear cache.
-
+import io
 import os
 import numpy as np
 import pandas as pd
 import streamlit as st
-import plotly.express as px
+import matplotlib.pyplot as plt
 import plotly.graph_objects as go
 
-st.set_page_config(page_title="Crossing & Possession Effectiveness", layout="wide")
+# KDE dependency
+try:
+    from scipy.stats import gaussian_kde
+    SCIPY_OK = True
+except Exception:
+    SCIPY_OK = False
 
-DEFAULT_CSV = "Events.csv"
 
 # ----------------------------
-# Data loading
+# Data loading (robust to comment/header junk)
 # ----------------------------
 @st.cache_data(show_spinner=False)
-def load_csv(path: str) -> pd.DataFrame:
-    return pd.read_csv(path)
+def load_possessions(file_bytes: bytes) -> pd.DataFrame:
+    """
+    Handles files that start with comment lines like:
+    # CSV-File created with merge-csv.com
+    and possible blank lines, by locating a plausible header row.
+    """
+    text = file_bytes.decode("utf-8", errors="ignore").splitlines()
 
-def load_data(uploaded) -> pd.DataFrame:
-    if uploaded is not None:
-        st.caption("Using uploaded file.")
-        return pd.read_csv(uploaded)
-    if os.path.exists(DEFAULT_CSV):
-        st.caption(f"Using local file: {DEFAULT_CSV}")
-        return load_csv(DEFAULT_CSV)
-    return None
+    header_idx = None
+    for i, line in enumerate(text[:150]):
+        s = line.strip()
+        if s.startswith("event_id,") and "match_id" in s and ("x_end" in s or "y_end" in s):
+            header_idx = i
+            break
+
+    if header_idx is None:
+        return pd.read_csv(io.BytesIO(file_bytes))
+
+    data_str = "\n".join(text[header_idx:])
+    return pd.read_csv(io.StringIO(data_str), engine="python")
+
+
+@st.cache_data(show_spinner=False)
+def load_from_path(path: str) -> pd.DataFrame:
+    with open(path, "rb") as f:
+        return load_possessions(f.read())
+
 
 # ----------------------------
-# Helpers (crossing pitch)
+# Pitch drawing (x in [-52.5, 52.5], y in [-34, 34])
 # ----------------------------
-def build_pitch_shapes_vertical(length=120, width=80):
-    """Vertical pitch (attack up): x axis = width (0..80), y axis = length (0..120)"""
-    shapes = []
-    shapes.append(dict(type="rect", x0=0, y0=0, x1=width, y1=length, line=dict(width=2)))
-    shapes.append(dict(type="line", x0=0, y0=length / 2, x1=width, y1=length / 2, line=dict(width=2)))
+def draw_pitch(ax):
+    ax.plot([-52.5, 52.5, 52.5, -52.5, -52.5],
+            [-34, -34, 34, 34, -34], linewidth=1)
+    ax.plot([0, 0], [-34, 34], linewidth=1)
 
-    pa_y = 18
-    pa_x0, pa_x1 = 18, 62
-    shapes.append(dict(type="rect", x0=pa_x0, y0=0, x1=pa_x1, y1=pa_y, line=dict(width=2)))
-    shapes.append(dict(type="rect", x0=pa_x0, y0=length - pa_y, x1=pa_x1, y1=length, line=dict(width=2)))
+    centre_circle = plt.Circle((0, 0), 9.15, fill=False, linewidth=1)
+    ax.add_artist(centre_circle)
 
-    sb_y = 6
-    sb_x0, sb_x1 = 30, 50
-    shapes.append(dict(type="rect", x0=sb_x0, y0=0, x1=sb_x1, y1=sb_y, line=dict(width=2)))
-    shapes.append(dict(type="rect", x0=sb_x0, y0=length - sb_y, x1=sb_x1, y1=length, line=dict(width=2)))
+    # Penalty areas (16.5m from goal line, 40.3m wide -> y +/-20.15)
+    ax.plot([-52.5, -36], [-20.15, -20.15], linewidth=1)
+    ax.plot([-36, -36], [-20.15, 20.15], linewidth=1)
+    ax.plot([-36, -52.5], [20.15, 20.15], linewidth=1)
 
-    shapes.append(
-        dict(
-            type="circle",
-            x0=width / 2 - 10,
-            y0=length / 2 - 10,
-            x1=width / 2 + 10,
-            y1=length / 2 + 10,
-            line=dict(width=2),
+    ax.plot([52.5, 36], [-20.15, -20.15], linewidth=1)
+    ax.plot([36, 36], [-20.15, 20.15], linewidth=1)
+    ax.plot([36, 52.5], [20.15, 20.15], linewidth=1)
+
+    ax.set_aspect("equal")
+    ax.set_xlim(-55, 55)
+    ax.set_ylim(-37, 37)
+    ax.axis("off")
+
+# ----------------------------
+# Thirds helpers (based on x coordinate)
+# ----------------------------
+def label_third_from_x(x: float) -> str:
+    """
+    Splits the pitch length (-52.5 to 52.5) into 3 equal thirds using boundaries at -17.5 and 17.5.
+    Defensive: x < -17.5
+    Middle:    -17.5 <= x <= 17.5
+    Attacking: x > 17.5
+    """
+    if pd.isna(x):
+        return "Unknown"
+    if x < -17.5:
+        return "Defensive"
+    if x > 17.5:
+        return "Attacking"
+    return "Middle"
+
+
+def thirds_progressed(start_x: float, end_x: float) -> int:
+    """
+    Counts how many thirds a possession moves through, ignoring directionality:
+    Defensive -> Middle = 1
+    Middle -> Attacking = 1
+    Defensive -> Attacking = 2
+    Otherwise = 0
+    """
+    s = label_third_from_x(start_x)
+    e = label_third_from_x(end_x)
+    if "Unknown" in (s, e):
+        return 0
+    mapping = {
+        ("Defensive", "Middle"): 1,
+        ("Middle", "Attacking"): 1,
+        ("Defensive", "Attacking"): 2,
+    }
+    return mapping.get((s, e), 0)
+
+
+
+# ----------------------------
+# Aggregation helpers
+# ----------------------------
+def add_team_possession_sequence_id(df: pd.DataFrame) -> tuple[pd.DataFrame, str | None]:
+    """
+    Adds a derived `team_possession_seq` per match by cumulatively summing
+    `first_player_possession_in_team_possession` (when present).
+
+    This works well when each team possession has its first row flagged.
+    """
+    df = df.copy()
+    if "index" in df.columns:
+        df = df.sort_values(["match_id", "index"])
+    else:
+        df = df.sort_values(["match_id", "frame_start"])
+
+    if "first_player_possession_in_team_possession" in df.columns:
+        # Ensure boolean-ish values are treated properly
+        first = df["first_player_possession_in_team_possession"].fillna(False).astype(bool)
+        df["team_possession_seq"] = first.groupby(df["match_id"]).cumsum()
+        warn = None
+    else:
+        # Fallback: treat every row as its own sequence (not great, but keeps app usable)
+        df["team_possession_seq"] = np.arange(len(df))
+        warn = (
+            "Column 'first_player_possession_in_team_possession' not found. "
+            "Falling back to treating each row as a separate sequence (effectiveness metrics will be less meaningful)."
         )
+    return df, warn
+
+
+def get_team_possession_ends(df: pd.DataFrame) -> tuple[pd.DataFrame, str | None]:
+    """
+    Uses last_player_possession_in_team_possession == True when present.
+    If the flag is missing, returns last row per (match_id, team_possession_seq).
+    """
+    df = df.copy()
+    if "last_player_possession_in_team_possession" in df.columns:
+        out = df[df["last_player_possession_in_team_possession"] == True].copy()
+        return out, None
+
+    # Fallback: last row per sequence
+    if "team_possession_seq" in df.columns:
+        if "index" in df.columns:
+            out = df.sort_values(["match_id", "team_possession_seq", "index"]).groupby(
+                ["match_id", "team_possession_seq"], as_index=False
+            ).tail(1)
+        else:
+            out = df.sort_values(["match_id", "team_possession_seq", "frame_end"]).groupby(
+                ["match_id", "team_possession_seq"], as_index=False
+            ).tail(1)
+        return out.copy(), (
+            "Column 'last_player_possession_in_team_possession' not found. "
+            "Using last row per derived team possession sequence as a fallback."
+        )
+
+    return df.copy(), (
+        "Could not aggregate to team possession ends (missing flags and derived sequence id). Using all rows."
     )
-    return shapes
 
-def make_segment_trace(x0, y0, x1, y1, color: str):
-    """Many line segments separated by NaN."""
-    xs = np.column_stack([x0, x1, np.full_like(x0, np.nan)]).ravel()
-    ys = np.column_stack([y0, y1, np.full_like(y0, np.nan)]).ravel()
-    return go.Scattergl(
-        x=xs,
-        y=ys,
-        mode="lines",
-        line=dict(width=2, color=color),
-        hoverinfo="skip",
-        showlegend=False,
-    )
 
-def classify_zone(start_x: float, start_y: float) -> str:
-    """Start-zone classification using StatsBomb-ish coords: X 0..120, Y 0..80"""
-    if start_x < 80:
-        return "Other"
-    wide = (start_y <= 20) or (start_y >= 60)
-    halfspace = ((20 < start_y <= 34) or (46 <= start_y < 60))
-    if wide and start_x >= 114:
-        return "Cutbacks & stand ups"
-    if wide and 108 <= start_x < 114:
-        return "Driven"
-    if wide and 96 <= start_x < 108:
-        return "Whipped"
-    if halfspace and 84 <= start_x < 108:
-        return "Diagonals"
-    return "Other"
+def summarise_sequences(df: pd.DataFrame, team_col: str) -> pd.DataFrame:
+    """
+    One row per team possession sequence (match_id + team_possession_seq),
+    with simple effectiveness proxies.
 
-def add_zone_overlays(fig: go.Figure, attack_up: bool, flip_len: bool, invert_width: bool):
-    def maybe_flip_x(x):
-        return 120 - x if flip_len else x
-    def width_map(y):
-        return 80 - y if invert_width else y
-    def rect(xmin, xmax, ymin, ymax):
-        x0, x1 = maybe_flip_x(xmin), maybe_flip_x(xmax)
-        x_low, x_high = (min(x0, x1), max(x0, x1))
-        wy0 = width_map(ymin)
-        wy1 = width_map(ymax)
-        w_low, w_high = (min(wy0, wy1), max(wy0, wy1))
-        if attack_up:
-            return dict(type="rect", x0=w_low, x1=w_high, y0=x_low, y1=x_high,
-                        line=dict(width=1, dash="dot"), opacity=0.15)
-        return dict(type="rect", x0=x_low, x1=x_high, y0=w_low, y1=w_high,
-                    line=dict(width=1, dash="dot"), opacity=0.15)
-    for args in [(84,108,20,34),(84,108,46,60),(96,108,0,20),(96,108,60,80),(108,114,0,20),(108,114,60,80),(114,120,0,20),(114,120,60,80)]:
-        fig.add_shape(rect(*args))
+    IMPORTANT: We build everything inside a single groupby.agg so indices align.
+    We also sort rows within sequences using the best available time/order column.
+    """
+    # Choose an order column that actually exists in this dataset
+    order_candidates = ["index", "frame_start", "time_start", "frame_end", "time_end", "event_id"]
+    order_col = next((c for c in order_candidates if c in df.columns), None)
 
-# ----------------------------
-# Possession inference + metrics
-# ----------------------------
-def _time_seconds(df: pd.DataFrame) -> pd.Series:
-    if "Minute" in df.columns and "Second" in df.columns:
-        return df["Minute"].fillna(0).astype(float) * 60 + df["Second"].fillna(0).astype(float)
-    return pd.Series(np.arange(len(df), dtype=float), index=df.index)
+    sort_cols = ["match_id", "team_possession_seq"] + ([order_col] if order_col else [])
+    d = df.sort_values(sort_cols).copy()
 
-def infer_possessions(df: pd.DataFrame) -> pd.DataFrame:
-    required = ["Match", "Team"]
-    missing = [c for c in required if c not in df.columns]
-    if missing:
-        raise ValueError(f"Missing required columns for possession inference: {missing}")
-    d = df.copy()
-    d["_t"] = _time_seconds(d)
-    d = d.sort_values(["Match", "_t"]).reset_index(drop=True)
+    gb = d.groupby(["match_id", "team_possession_seq"], as_index=False)
 
-    def is_shot_row(r) -> bool:
-        for c in ["Event", "Type", "Action"]:
-            if c in d.columns and isinstance(r.get(c), str) and "shot" in r[c].lower():
-                return True
-        return False
+    def first(series):
+        return series.iloc[0]
 
-    def is_turnover_row(r) -> bool:
-        if "Outcome" in d.columns and isinstance(r.get("Outcome"), str):
-            if r["Outcome"].lower() in ["incomplete", "out", "lost"]:
-                return True
-        for c in ["Turnover", "turnover", "is_turnover"]:
-            if c in d.columns:
-                v = r.get(c)
-                if isinstance(v, (int, float)) and int(v) == 1:
-                    return True
-                if isinstance(v, str) and v.lower() in ["1","true","yes"]:
-                    return True
-        return False
+    def last(series):
+        return series.iloc[-1]
 
-    def is_foul_row(r) -> bool:
-        for c in ["Event", "Type", "Action"]:
-            if c in d.columns and isinstance(r.get(c), str) and "foul" in r[c].lower():
-                return True
-        return False
+    agg_spec = {
+        "team": (team_col, first),
+        "start_x": ("x_start", first),
+        "start_y": ("y_start", first),
+        "end_x": ("x_end", last),
+        "end_y": ("y_end", last),
+        "duration": ("duration", "sum"),
+        "n_player_possessions": ("event_id", "size"),
+    }
 
-    poss_ids = []
-    current = 0
-    prev_match = None
-    prev_team = None
-    prev_end = True
-
-    for _, r in d.iterrows():
-        m = r["Match"]
-        team = r["Team"]
-        new_poss = False
-        if prev_match is None or m != prev_match:
-            new_poss = True
-        elif team != prev_team:
-            new_poss = True
-        elif prev_end:
-            new_poss = True
-        if new_poss:
-            current += 1
-        poss_ids.append(current)
-        prev_match = m
-        prev_team = team
-        prev_end = is_shot_row(r) or is_turnover_row(r) or is_foul_row(r)
-
-    d["possession_id"] = poss_ids
-    return d
-
-def add_match_state(df: pd.DataFrame) -> pd.DataFrame:
-    d = df.copy()
-    candidates = [
-        ("team_score", "opp_score"),
-        ("Team Score", "Opp Score"),
-        ("score_for", "score_against"),
-        ("Home Score", "Away Score"),
-    ]
-    found = None
-    for a, b in candidates:
-        if a in d.columns and b in d.columns:
-            found = (a, b)
-            break
-    if found is None:
-        return d
-    a, b = found
-    diff = pd.to_numeric(d[a], errors="coerce") - pd.to_numeric(d[b], errors="coerce")
-    d["match_state"] = np.where(diff > 0, "Winning", np.where(diff < 0, "Losing", "Drawing"))
-    return d
-
-def compute_possession_tables(df: pd.DataFrame) -> dict:
-    d = df.copy()
-    d["_t"] = _time_seconds(d)
-
-    d["_shot"] = False
-    for c in ["Event", "Type", "Action"]:
-        if c in d.columns:
-            d["_shot"] = d["_shot"] | d[c].astype(str).str.lower().str.contains("shot", na=False)
-
-    d["_cross"] = True
-    if "Action" in d.columns:
-        d["_cross"] = d["Action"].astype(str).str.lower().str.contains("cross", na=False)
-    if "is_cross" in d.columns:
-        d["_cross"] = d["is_cross"].fillna(0).astype(int).eq(1)
-
-    d["_box_entry"] = False
-    if {"End X", "End Y"}.issubset(d.columns):
-        d["_box_entry"] = (pd.to_numeric(d["End X"], errors="coerce") >= 102) & pd.to_numeric(d["End Y"], errors="coerce").between(18, 62)
-
-    if {"Start X", "End X"}.issubset(d.columns):
-        d["_prog"] = (pd.to_numeric(d["End X"], errors="coerce") - pd.to_numeric(d["Start X"], errors="coerce")).fillna(0.0)
+    # Optional outcome flags
+    if "lead_to_shot" in d.columns:
+        agg_spec["lead_to_shot"] = ("lead_to_shot", "max")
     else:
-        d["_prog"] = 0.0
+        # Will fill after agg
+        pass
 
-    xg_col = None
-    for c in ["xG", "xg", "shot_xg", "expected_goals"]:
-        if c in d.columns:
-            xg_col = c
-            break
-    if xg_col:
-        d["_xg"] = pd.to_numeric(d[xg_col], errors="coerce").fillna(0.0)
-    else:
-        d["_xg"] = np.nan
+    if "lead_to_goal" in d.columns:
+        agg_spec["lead_to_goal"] = ("lead_to_goal", "max")
 
-    poss = d.groupby(["Match", "Team", "possession_id"], dropna=False).agg(
-        events=("Team", "size"),
-        duration=("_t", lambda s: float(s.max() - s.min()) if len(s) else 0.0),
-        progressed=("_prog", "sum"),
-        has_cross=("_cross", "max"),
-        has_shot=("_shot", "max"),
-        has_box=("_box_entry", "max"),
-        xg_sum=("_xg", "sum") if xg_col else ("Team", lambda s: np.nan),
-    ).reset_index()
+    # Optional end-zone labels/flags (take last value in the sequence)
+    if "third_end" in d.columns:
+        agg_spec["third_end"] = ("third_end", last)
 
-    poss["outcome"] = np.where(poss["has_shot"], "Shot",
-                       np.where(poss["has_box"], "Box Entry",
-                       np.where(poss["has_cross"], "Cross",
-                       "Turnover/Other")))
+    if "penalty_area_end" in d.columns:
+        agg_spec["penalty_area_end"] = ("penalty_area_end", last)
 
-    poss["is_counter"] = (poss["duration"] <= 10) & (poss["progressed"] >= 25) & (poss["events"] <= 6)
-    poss["directness"] = poss["progressed"] / poss["events"].replace(0, np.nan)
+    out = gb.agg(**agg_spec)
 
-    team = poss.groupby("Team").agg(
-        possessions=("possession_id", "nunique"),
-        shot_poss_pct=("has_shot", lambda x: 100 * x.mean()),
-        box_poss_pct=("has_box", lambda x: 100 * x.mean()),
-        cross_poss_pct=("has_cross", lambda x: 100 * x.mean()),
-        xg_per_poss=("xg_sum", lambda x: np.nan if x.isna().all() else x.sum() / max(len(x), 1)),
-        passes_per_poss=("events", "mean"),
-        duration_s=("duration", "mean"),
-        meters_progressed=("progressed", "mean"),
-        directness=("directness", "mean"),
-        counter_poss_pct=("is_counter", lambda x: 100 * x.mean()),
-    ).reset_index()
+    # Ensure missing optional columns exist with sensible defaults
+    if "lead_to_shot" not in out.columns:
+        out["lead_to_shot"] = False
+    if "lead_to_goal" not in out.columns:
+        out["lead_to_goal"] = False
+    if "third_end" not in out.columns:
+        out["third_end"] = np.nan
+    if "penalty_area_end" not in out.columns:
+        out["penalty_area_end"] = np.nan
 
-    out = poss.pivot_table(index="Team", columns="outcome", values="possession_id", aggfunc="count", fill_value=0).reset_index()
-    total = out.drop(columns=["Team"]).sum(axis=1).replace(0, np.nan)
-    for c in out.columns:
-        if c != "Team":
-            out[c + "_pct"] = 100 * out[c] / total
-
-    flow = poss.copy()
-    flow["stage1"] = "Build"
-    flow["stage2"] = np.where(flow["has_cross"], "Cross", "No Cross")
-    flow["stage3"] = np.where(flow["has_box"], "Box Entry", "No Box Entry")
-    flow["stage4"] = np.where(flow["has_shot"], "Shot", "No Shot")
-    sankey_counts = flow.groupby(["stage1","stage2","stage3","stage4"]).size().reset_index(name="count")
-
-    return {"poss": poss, "team": team, "outcomes": out, "sankey": sankey_counts}
-
-def percentile_ranks(team_df: pd.DataFrame, cols: list) -> pd.DataFrame:
-    out = team_df.copy()
-    for c in cols:
-        if c in out.columns:
-            s = pd.to_numeric(out[c], errors="coerce")
-            out[c + "_pctile"] = s.rank(pct=True) * 100
+    out["progression_x"] = out["end_x"] - out["start_x"]
+    out["progression_abs_x"] = out["progression_x"].abs()
     return out
 
 
-def compute_player_profiles(df: pd.DataFrame) -> pd.DataFrame:
-    """Player profiles: progression (xT proxy) vs chance creation (xA proxy)."""
-    d = df.copy()
 
-    if {"Start X", "End X"}.issubset(d.columns):
-        d["_prog"] = pd.to_numeric(d["End X"], errors="coerce") - pd.to_numeric(d["Start X"], errors="coerce")
-    else:
-        d["_prog"] = 0.0
+# ----------------------------
+# KDE heatmap plotter
+# ----------------------------
+def kde_density_grid(x, y, xmin=-52.5, xmax=52.5, ymin=-34, ymax=34, nx=300, ny=200):
+    x = np.asarray(x, dtype=float)
+    y = np.asarray(y, dtype=float)
 
-    d["_xa"] = 0.0
-    if "Outcome" in d.columns:
-        complete = d["Outcome"].astype(str).str.lower().eq("complete")
-    else:
-        complete = True
+    xx, yy = np.mgrid[xmin:xmax:complex(nx), ymin:ymax:complex(ny)]
+    positions = np.vstack([xx.ravel(), yy.ravel()])
+    values = np.vstack([x, y])
 
-    if {"End X", "End Y"}.issubset(d.columns):
-        box = (pd.to_numeric(d["End X"], errors="coerce") >= 102) & pd.to_numeric(d["End Y"], errors="coerce").between(18, 62)
-        d.loc[complete & box, "_xa"] = 0.05
+    kde = gaussian_kde(values)  # Scott's rule
+    zz = np.reshape(kde(positions).T, xx.shape)
+    return xx, yy, zz
 
-    if "Player" not in d.columns:
-        return pd.DataFrame()
 
-    return (
-        d.groupby("Player")
-        .agg(progression=("_prog", "sum"), xa_proxy=("_xa", "sum"), events=("Player", "size"))
-        .reset_index()
+def plot_kde(ax, x, y, alpha=0.85):
+    xmin, xmax = -52.5, 52.5
+    ymin, ymax = -34, 34
+
+    if not SCIPY_OK:
+        draw_pitch(ax)
+        ax.set_title("scipy not installed (needed for KDE)")
+        return None
+
+    if len(x) < 2:
+        draw_pitch(ax)
+        ax.set_title("Not enough points for KDE")
+        return None
+
+    _, _, zz = kde_density_grid(x, y, xmin=xmin, xmax=xmax, ymin=ymin, ymax=ymax)
+
+    draw_pitch(ax)
+    img = ax.imshow(
+        zz.T,
+        origin="lower",
+        extent=[xmin, xmax, ymin, ymax],
+        alpha=alpha,
+        aspect="equal",
     )
+    return img
 
 
 # ----------------------------
 # App
 # ----------------------------
-st.title("Crossing Dashboard + Team Comparisons + Possession Effectiveness")
+st.set_page_config(page_title="Possession KDE Comparison", layout="wide")
+st.title("Possession Analysis – KDE Heatmaps + Effectiveness + Player Links")
 
-left, right = st.columns([1, 2], vertical_alignment="top")
+st.caption(
+    "Compares two teams using KDE heatmaps of **team possession sequence end locations**, "
+    "plus simple effectiveness metrics and player involvement / combinations."
+)
 
-with left:
-    st.subheader("Data")
-    uploaded = st.file_uploader("Upload Events CSV (optional)", type=["csv"])
-    df = load_data(uploaded)
+
+# --- Player value tables (external CSVs) ---
+@st.cache_data(show_spinner=False)
+def load_value_table(rel_path: str, uploaded_file=None) -> pd.DataFrame:
+    """
+    Load a player-value table either from a repo-relative path (recommended for Streamlit Cloud)
+    or from an uploaded file.
+    """
+    df = None
+    if uploaded_file is not None:
+        try:
+            df = pd.read_csv(uploaded_file)
+        except Exception:
+            df = None
+
     if df is None:
-        st.error("No file uploaded and Events.csv not found. Please upload your CSV or add Events.csv next to app.py.")
-        st.stop()
-
-    required_cols = ["Start X", "Start Y", "End X", "End Y"]
-    missing = [c for c in required_cols if c not in df.columns]
-    if missing:
-        st.error(f"Missing required columns for pitch map: {missing}")
-        st.stop()
-
-    df = add_match_state(df)
-
-    st.subheader("Filters")
-
-    teams = sorted(df["Team"].dropna().unique()) if "Team" in df.columns else []
-    team = None
-    if teams:
-        default_team = "Manchester United" if "Manchester United" in teams else teams[0]
-        team = st.selectbox("Team", teams, index=teams.index(default_team))
-
-    pass_heights = sorted(df["Pass height"].dropna().unique()) if "Pass height" in df.columns else []
-    selected_heights = None
-    if pass_heights:
-        height_mode = st.radio("Cross height", ["All", "High only", "Low + Ground only", "Custom"], index=0)
-        if height_mode == "Custom":
-            selected_heights = st.multiselect("Select heights", pass_heights, default=pass_heights)
-        elif height_mode == "High only":
-            selected_heights = ["high"] if "high" in pass_heights else pass_heights[:1]
-        elif height_mode == "Low + Ground only":
-            selected_heights = [h for h in ["low", "ground"] if h in pass_heights] or pass_heights
+        p = os.path.join(os.path.dirname(__file__), rel_path)
+        if os.path.exists(p):
+            df = pd.read_csv(p)
         else:
-            selected_heights = pass_heights
+            return pd.DataFrame()
 
-    outcomes = sorted(df["Outcome"].dropna().unique()) if "Outcome" in df.columns else []
-    selected_outcomes = st.multiselect("Outcome", outcomes, default=outcomes) if outcomes else None
+    # Clean common artifacts
+    for c in ["Unnamed: 0", "Unnamed:0"]:
+        if c in df.columns:
+            df = df.drop(columns=[c])
 
-    matches = sorted(df["Match"].dropna().unique()) if "Match" in df.columns else []
-    selected_matches = st.multiselect("Match", matches, default=matches) if matches else None
+    # Standardise key column names (keep original if present)
+    rename_map = {
+        "player": "player_name",
+        "team": "team_name",
+        "role": "role_label",
+    }
+    for a, b in rename_map.items():
+        if a in df.columns and b not in df.columns:
+            df = df.rename(columns={a: b})
 
-    players = sorted(df["Player"].dropna().unique()) if "Player" in df.columns else []
-    selected_players = st.multiselect("Player", players, default=players) if players else None
+    return df
 
-    match_states = sorted(df["match_state"].dropna().unique()) if "match_state" in df.columns else []
-    selected_states = st.multiselect("Match state", match_states, default=match_states) if match_states else None
+def _infer_mu_team_name(value_df: pd.DataFrame) -> str | None:
+    if "team_name" not in value_df.columns or value_df.empty:
+        return None
+    teams = value_df["team_name"].dropna().astype(str).unique().tolist()
+    for t in teams:
+        tl = t.lower()
+        if "manchester united" in tl or "man utd" in tl or "man united" in tl:
+            return t
+    return None
 
-    st.subheader("View options")
-    attack_up = st.toggle("Attack upwards (rotate pitch)", value=True)
-    flip_direction = st.toggle("Flip direction (length)", value=False)
-    invert_width = st.toggle("Invert width (fix left/right)", value=True)
-    show_zone_overlays = st.toggle("Show start-zone overlays", value=True)
-    show_endpoints = st.toggle("Show endpoints", value=False)
-    show_table = st.toggle("Show data table", value=True)
+def barh_rank(ax, df: pd.DataFrame, label_col: str, value_col: str, title: str, top_n: int = 10, ascending: bool = False):
+    d = df[[label_col, value_col]].dropna().copy()
+    d[value_col] = pd.to_numeric(d[value_col], errors="coerce")
+    d = d.dropna(subset=[value_col]).sort_values(value_col, ascending=ascending).head(top_n) if ascending else d.sort_values(value_col, ascending=False).head(top_n)
+    ax.barh(d[label_col].astype(str).values[::-1], d[value_col].values[::-1])
+    ax.set_title(title)
+    ax.set_xlabel(value_col)
+# ==============================
+# Data loading (auto from repo /data)
+# ==============================
+BASE_DIR = os.path.dirname(__file__)
+DATA_DIR = os.path.join(BASE_DIR, "data")
 
-    st.subheader("Start zone filter")
-    zone_options = ["Diagonals", "Whipped", "Driven", "Cutbacks & stand ups", "Other"]
-    selected_zones = st.multiselect("Start Zones", zone_options,
-                                    default=["Diagonals", "Whipped", "Driven", "Cutbacks & stand ups"])
+# Pick possessions CSV automatically
+preferred = os.path.join(DATA_DIR, "MUWFCPOSSESSIONS.csv")
+legacy = os.path.join(DATA_DIR, "possessions.csv")
 
-    st.subheader("Start side filter")
-    side_choice = st.radio("Crosses delivered from", ["Both", "Left", "Right"], index=0, horizontal=True)
+def _is_player_value_table(name: str) -> bool:
+    n = name.lower()
+    return any(k in n for k in [
+        "top_progression",
+        "top_chance_creators",
+        "role-adjusted",
+        "net_negative",
+        "attacking_value",
+        "per_100_possessions",
+    ])
 
-    st.subheader("End location filters")
-    use_end_filters = st.toggle("Enable end-location filtering", value=False)
-    end_x_range = (0.0, 120.0)
-    end_y_range = (0.0, 80.0)
-    in_box_only = False
-    if use_end_filters:
-        end_x_range = st.slider("End X range (0–120)", 0.0, 120.0, (0.0, 120.0), 1.0)
-        end_y_range = st.slider("End Y range (0–80)", 0.0, 80.0, (0.0, 80.0), 1.0)
-        in_box_only = st.toggle("End location inside penalty area only", value=False)
+repo_csvs = []
+if os.path.isdir(DATA_DIR):
+    repo_csvs = [f for f in os.listdir(DATA_DIR) if f.lower().endswith('.csv')]
 
-# Apply filters for map
-f = df.copy()
-if team and "Team" in f.columns:
-    f = f[f["Team"] == team]
-if selected_heights is not None and "Pass height" in f.columns:
-    f = f[f["Pass height"].isin(selected_heights)]
-if selected_outcomes is not None and "Outcome" in f.columns:
-    f = f[f["Outcome"].isin(selected_outcomes)]
-if selected_matches is not None and "Match" in f.columns:
-    f = f[f["Match"].isin(selected_matches)]
-if selected_players is not None and "Player" in f.columns:
-    f = f[f["Player"].isin(selected_players)]
-if selected_states is not None and "match_state" in f.columns:
-    f = f[f["match_state"].isin(selected_states)]
-
-f = f.dropna(subset=["Start X", "Start Y", "End X", "End Y"]).copy()
-
-if flip_direction:
-    f["_sx"] = 120 - f["Start X"]
-    f["_ex"] = 120 - f["End X"]
+possessions_path = None
+if os.path.exists(preferred):
+    possessions_path = preferred
+elif os.path.exists(legacy):
+    possessions_path = legacy
 else:
-    f["_sx"] = f["Start X"]
-    f["_ex"] = f["End X"]
+    # choose largest non-value CSV
+    candidates = [f for f in repo_csvs if not _is_player_value_table(f)]
+    if candidates:
+        sizes = sorted(((os.path.getsize(os.path.join(DATA_DIR,f)), f) for f in candidates), reverse=True)
+        possessions_path = os.path.join(DATA_DIR, sizes[0][1])
 
-f["_sy"] = f["Start Y"]
-f["_ey"] = f["End Y"]
+with st.sidebar:
+    st.header("Data")
+    st.caption("Auto-loading from the GitHub repo /data folder. Upload is only a fallback.")
+    uploaded = st.file_uploader("Upload possessions CSV (fallback)", type=["csv"])
 
-def width_map(arr):
-    return 80 - arr if invert_width else arr
-
-f["Start Zone"] = [classify_zone(x, y) for x, y in zip(f["_sx"].to_numpy(), f["_sy"].to_numpy())]
-if selected_zones:
-    f = f[f["Start Zone"].isin(selected_zones)]
+if possessions_path is not None:
+    df = load_from_path(possessions_path)
+elif uploaded is not None:
+    df = load_possessions(uploaded.getvalue())
 else:
-    f = f.iloc[0:0]
+    st.error("No possessions CSV found in /data. Add MUWFCPOSSESSIONS.csv (recommended) to /data, or upload a CSV in the sidebar.")
+    st.stop()
 
-f["Start Side"] = np.where(width_map(f["Start Y"].to_numpy()) < 40, "Left", "Right")
-if side_choice != "Both":
-    f = f[f["Start Side"] == side_choice]
+# Sidebar status for auxiliary tables
+def _exists(rel_name: str) -> bool:
+    return os.path.exists(os.path.join(DATA_DIR, rel_name))
 
-if use_end_filters and len(f) > 0:
-    f = f[(f["_ex"].between(end_x_range[0], end_x_range[1])) & (f["_ey"].between(end_y_range[0], end_y_range[1]))]
-    if in_box_only:
-        f = f[(f["_ex"] >= 102) & (f["_ey"].between(18, 62))]
+with st.sidebar.expander("Data status", expanded=False):
+    st.write("Possessions:", os.path.basename(possessions_path) if possessions_path else "(uploaded)", f"({df.shape[0]} rows)")
+    st.write("xT table:", "✅" if _exists("Top_progression__xT__per_100_possessions.csv") else "❌")
+    st.write("xA table:", "✅" if _exists("Top_chance_creators__xA__per_100_possessions.csv") else "❌")
+    st.write("Best role-adjusted:", "✅" if _exists("Best_role-adjusted_attacking_value__per_100_possessions_.csv") else "❌")
+    st.write("Worst role-adjusted:", "✅" if _exists("Worst_role-adjusted_attacking_value__per_100_possessions_.csv") else "❌")
+    st.write("Net negative:", "✅" if _exists("Net_negative_total_attacking_value__sample_filtered_.csv") else "❌")
 
-if "Outcome" in f.columns:
-    success = f["Outcome"].astype(str).str.lower().eq("complete").to_numpy()
-else:
-    success = np.zeros(len(f), dtype=bool)
+# Required columns
+required = {"match_id", "x_start", "y_start", "x_end", "y_end"}
+missing = [c for c in required if c not in df.columns]
+if missing:
+    st.error(f"Missing required columns: {missing}")
+    st.stop()
 
-pitch_len, pitch_wid = 120, 80
-plot_start_x = f["_sx"].to_numpy()
-plot_end_x = f["_ex"].to_numpy()
-plot_start_w = width_map(f["_sy"].to_numpy())
-plot_end_w = width_map(f["_ey"].to_numpy())
+# Type coercions
+for c in ["x_start", "y_start", "x_end", "y_end", "duration"]:
+    if c in df.columns:
+        df[c] = pd.to_numeric(df[c], errors="coerce")
 
-if attack_up:
-    sx, sy = plot_start_w, plot_start_x
-    ex, ey = plot_end_w, plot_end_x
-    x_range, y_range = (0, pitch_wid), (0, pitch_len)
-else:
-    sx, sy = plot_start_x, plot_start_w
-    ex, ey = plot_end_x, plot_end_w
-    x_range, y_range = (0, pitch_len), (0, pitch_wid)
+team_col = "team_shortname" if "team_shortname" in df.columns else ("team_id" if "team_id" in df.columns else None)
+if team_col is None:
+    st.error("Could not find a team identifier column (team_shortname or team_id).")
+    st.stop()
 
-# Possession analytics
-df_poss = infer_possessions(df)
-if selected_states is not None and "match_state" in df_poss.columns and len(selected_states) > 0:
-    df_poss = df_poss[df_poss["match_state"].isin(selected_states)]
+# --- Base filtering dataset (player possessions) ---
+match_ids = sorted(df["match_id"].dropna().unique().tolist())
 
-tables = compute_possession_tables(df_poss)
-poss_team = tables["team"]
-poss_out = tables["outcomes"]
-sankey_counts = tables["sankey"]
-poss_df = tables["poss"]
+with st.sidebar:
+    st.header("Filters")
+    selected_matches = st.multiselect("Match(es)", match_ids, default=match_ids)
 
-rank_cols = ["shot_poss_pct","box_poss_pct","xg_per_poss","passes_per_poss","duration_s","meters_progressed","directness","counter_poss_pct"]
-poss_team_ranks = percentile_ranks(poss_team, rank_cols)
+dff = df[df["match_id"].isin(selected_matches)].copy()
+dff_all = dff.copy()  # snapshot before any team-scope filtering
 
-with right:
-    tab_map, tab_team, tab_poss_eff = st.tabs(["🗺️ Crossing Map", "📊 Team Comparison", "⚙️ Possession Effectiveness"])
+# Optional filters (phase and half)
+with st.sidebar:
+    if "team_in_possession_phase_type" in dff_all.columns:
+        phase_opts = ["All"] + sorted([x for x in dff["team_in_possession_phase_type"].dropna().unique().tolist()])
+        phase_choice = st.selectbox("In-possession phase", phase_opts, index=0)
+        if phase_choice != "All":
+            dff = dff[dff["team_in_possession_phase_type"] == phase_choice]
 
-    with tab_map:
-        st.subheader("Pitch map")
-        st.caption(f"Showing {len(f):,} crosses after filters.")
+    half_col = None
+    for cand in ["period", "half", "match_period"]:
+        if cand in dff.columns:
+            half_col = cand
+            break
+    if half_col is not None:
+        half_opts = ["All"] + sorted([x for x in dff[half_col].dropna().unique().tolist()])
+        half_choice = st.selectbox("Half / period", half_opts, index=0)
+        if half_choice != "All":
+            dff = dff[dff[half_col] == half_choice]
 
-        fig = go.Figure()
-        if attack_up:
-            fig.update_layout(
-                xaxis=dict(range=x_range, showgrid=False, zeroline=False, visible=False, scaleanchor="y", scaleratio=1),
-                yaxis=dict(range=y_range, showgrid=False, zeroline=False, visible=False),
-                shapes=build_pitch_shapes_vertical(length=pitch_len, width=pitch_wid),
-                margin=dict(l=10, r=10, t=10, b=10),
-            )
-        else:
+# Add derived sequence id
+
+
+# Optional: zone filters (by thirds, pitch zones, or custom rectangle)
+with st.sidebar:
+    st.subheader("Zone filter")
+    zone_target = st.selectbox(
+        "Apply zone filter to",
+        ["None", "Possession end location (x_end, y_end)", "Possession start location (x_start, y_start)"],
+        index=0,
+        help="Filters the underlying rows used for heatmaps, effectiveness, and player sections."
+    )
+
+    zone_mode = st.selectbox("Zone mode", ["Thirds", "Pitch zones", "Custom rectangle"], index=1)
+
+# Apply zone filter (if chosen)
+if zone_target != "None":
+    if "end location" in zone_target:
+        zx, zy = "x_end", "y_end"
+    else:
+        zx, zy = "x_start", "y_start"
+
+    # Ensure numeric
+    dff[zx] = pd.to_numeric(dff[zx], errors="coerce")
+    dff[zy] = pd.to_numeric(dff[zy], errors="coerce")
+
+    if zone_mode == "Thirds":
+        with st.sidebar:
+            third_choice = st.selectbox("Select third", ["Defensive", "Middle", "Attacking"])
+        dff["_zone_third"] = dff[zx].apply(label_third_from_x)
+        dff = dff[dff["_zone_third"] == third_choice].copy()
+
+    elif zone_mode == "Pitch zones":
+        # Define a pitch grid: 6 columns (length) x 4 rows (width) = 24 zones
+        x_edges = np.linspace(-52.5, 52.5, 7)  # 6 bins
+        y_edges = np.linspace(-34.0, 34.0, 5)  # 4 bins
+
+        def zone_id_for_xy(x, y):
+            if pd.isna(x) or pd.isna(y):
+                return None
+            xi = np.searchsorted(x_edges, x, side="right") - 1
+            yi = np.searchsorted(y_edges, y, side="right") - 1
+            if xi < 0 or xi >= 6 or yi < 0 or yi >= 4:
+                return None
+            return f"Z{yi+1}-{xi+1}"  # row-col (1-indexed), row is bottom->top
+
+        # Build zone centers for clickable selection
+        zone_centers = []
+        zone_ids = []
+        for r in range(4):      # rows (bottom->top)
+            for c in range(6):  # cols (left->right)
+                x0, x1 = x_edges[c], x_edges[c+1]
+                y0, y1 = y_edges[r], y_edges[r+1]
+                zone_centers.append(((x0 + x1) / 2.0, (y0 + y1) / 2.0))
+                zone_ids.append(f"Z{r+1}-{c+1}")
+
+        # Persist selection in session_state
+        if "selected_zones" not in st.session_state:
+            st.session_state["selected_zones"] = []
+
+        with st.sidebar:
+            st.markdown("**Clickable pitch – select zones**")
+            st.caption("Click points to select. Use box/lasso to multi-select. Double-click to reset selection.")
+            show_zone_labels = st.checkbox("Show zone labels", value=False)
+
+        # Plotly pitch + clickable zone points
+        def make_pitch_zone_fig(selected):
+            xs = [p[0] for p in zone_centers]
+            ys = [p[1] for p in zone_centers]
+            texts = zone_ids if show_zone_labels else [""] * len(zone_ids)
+
+            fig = go.Figure()
+
+            # Zone points
+            fig.add_trace(go.Scatter(
+                x=xs, y=ys,
+                mode="markers+text" if show_zone_labels else "markers",
+                text=texts,
+                textposition="middle center",
+                customdata=zone_ids,
+                marker=dict(size=16, opacity=0.85),
+                selected=dict(marker=dict(size=18, opacity=1.0)),
+                unselected=dict(marker=dict(opacity=0.45)),
+            ))
+
+            # Pitch outline + key markings as shapes
             shapes = []
-            shapes.append(dict(type="rect", x0=0, y0=0, x1=pitch_len, y1=pitch_wid, line=dict(width=2)))
-            shapes.append(dict(type="line", x0=pitch_len / 2, y0=0, x1=pitch_len / 2, y1=pitch_wid, line=dict(width=2)))
-            pa_x = 18
-            pa_y0, pa_y1 = 18, 62
-            shapes.append(dict(type="rect", x0=0, y0=pa_y0, x1=pa_x, y1=pa_y1, line=dict(width=2)))
-            shapes.append(dict(type="rect", x0=pitch_len - pa_x, y0=pa_y0, x1=pitch_len, y1=pa_y1, line=dict(width=2)))
-            sb_x = 6
-            sb_y0, sb_y1 = 30, 50
-            shapes.append(dict(type="rect", x0=0, y0=sb_y0, x1=sb_x, y1=sb_y1, line=dict(width=2)))
-            shapes.append(dict(type="rect", x0=pitch_len - sb_x, y0=sb_y0, x1=pitch_len, y1=sb_y1, line=dict(width=2)))
-            shapes.append(dict(type="circle", x0=pitch_len / 2 - 10, y0=pitch_wid / 2 - 10,
-                               x1=pitch_len / 2 + 10, y1=pitch_wid / 2 + 10, line=dict(width=2)))
+            # Outline
+            shapes.append(dict(type="rect", x0=-52.5, y0=-34, x1=52.5, y1=34, line=dict(width=2)))
+            # Halfway
+            shapes.append(dict(type="line", x0=0, y0=-34, x1=0, y1=34, line=dict(width=2)))
+            # Centre circle (approx with many points via shape circle)
+            shapes.append(dict(type="circle", x0=-9.15, y0=-9.15, x1=9.15, y1=9.15, line=dict(width=2)))
+            # Penalty areas
+            shapes.append(dict(type="rect", x0=-52.5, y0=-20.15, x1=-36, y1=20.15, line=dict(width=2)))
+            shapes.append(dict(type="rect", x0=36, y0=-20.15, x1=52.5, y1=20.15, line=dict(width=2)))
+
+            # Grid lines
+            for xe in x_edges[1:-1]:
+                shapes.append(dict(type="line", x0=xe, y0=-34, x1=xe, y1=34, line=dict(width=1, dash="dot")))
+            for ye in y_edges[1:-1]:
+                shapes.append(dict(type="line", x0=-52.5, y0=ye, x1=52.5, y1=ye, line=dict(width=1, dash="dot")))
+
+            # Highlight selected zones as translucent rectangles
+            for zid in selected:
+                r, c = zid[1:].split("-")
+                r = int(r) - 1
+                c = int(c) - 1
+                x0, x1 = x_edges[c], x_edges[c+1]
+                y0, y1 = y_edges[r], y_edges[r+1]
+                shapes.append(dict(type="rect", x0=x0, y0=y0, x1=x1, y1=y1,
+                                   fillcolor="rgba(0,0,0,0.15)", line=dict(width=0)))
+
             fig.update_layout(
-                xaxis=dict(range=x_range, showgrid=False, zeroline=False, visible=False, scaleanchor="y", scaleratio=1),
-                yaxis=dict(range=y_range, showgrid=False, zeroline=False, visible=False),
                 shapes=shapes,
                 margin=dict(l=10, r=10, t=10, b=10),
+                xaxis=dict(range=[-55, 55], showgrid=False, zeroline=False, visible=False),
+                yaxis=dict(range=[-37, 37], showgrid=False, zeroline=False, visible=False, scaleanchor="x", scaleratio=1),
+                dragmode="select",  # enables box select (and lasso via modebar)
+                height=320,
+            )
+            return fig
+
+        fig = make_pitch_zone_fig(st.session_state["selected_zones"])
+
+        # Streamlit selection events (no extra component needed)
+        sel = st.plotly_chart(fig, use_container_width=True, key="zone_pitch", on_select="rerun")
+        # On Streamlit versions that support selection events, selection is stored in session_state:
+        # st.session_state["zone_pitch"] contains {"selection": {...}} when available.
+        sel_state = st.session_state.get("zone_pitch", {})
+        selection = sel_state.get("selection", None)
+
+        if selection and "points" in selection and selection["points"]:
+            newly_selected = [p.get("customdata") for p in selection["points"] if p.get("customdata")]
+            # Update selection (toggle behavior)
+            current = set(st.session_state["selected_zones"])
+            for z in newly_selected:
+                if z in current:
+                    current.remove(z)
+                else:
+                    current.add(z)
+            st.session_state["selected_zones"] = sorted(current)
+
+        selected = st.session_state["selected_zones"]
+
+        if selected:
+            dff["_zone_id"] = [zone_id_for_xy(x, y) for x, y in zip(dff[zx], dff[zy])]
+            dff = dff[dff["_zone_id"].isin(selected)].copy()
+        else:
+            st.sidebar.warning("No zones selected — zone filter not applied.")
+
+
+    else:
+        with st.sidebar:
+            x_min, x_max = st.slider("x range", min_value=-52.5, max_value=52.5, value=(-52.5, 52.5), step=0.5)
+            y_min, y_max = st.slider("y range", min_value=-34.0, max_value=34.0, value=(-34.0, 34.0), step=0.5)
+        dff = dff[(dff[zx] >= x_min) & (dff[zx] <= x_max) & (dff[zy] >= y_min) & (dff[zy] <= y_max)].copy()
+
+dff, seq_warn = add_team_possession_sequence_id(dff)
+if seq_warn:
+    st.warning(seq_warn)
+dff_all, _seq_warn_all = add_team_possession_sequence_id(dff_all)
+# We intentionally do not show _seq_warn_all to avoid duplicate warnings.
+
+
+# Teams after filtering
+teams = sorted(dff[team_col].dropna().unique().tolist())
+if not teams:
+    st.error("No teams found after filtering.")
+    st.stop()
+
+# Team picker with MU heuristic
+default_mu = None
+for t in teams:
+    s = str(t).lower()
+    if "man" in s and ("utd" in s or "united" in s):
+        default_mu = t
+        break
+if default_mu is None:
+    default_mu = teams[0]
+
+with st.sidebar:
+    st.header("Compare")
+    left_team = st.selectbox("Team A", teams, index=teams.index(default_mu) if default_mu in teams else 0)
+    other_teams = [t for t in teams if t != left_team]
+    right_team = st.selectbox("Team B", other_teams, index=0 if other_teams else 0)
+
+    scope = st.radio(
+        "Comparison scope",
+        ["Across selected matches", "Only matches where both teams appear"],
+        index=0,
+        help="Second option restricts to match_ids containing both Team A and Team B.",
+    )
+
+# Apply scope restriction at the sequence level (and propagate to player possessions)
+if scope == "Only matches where both teams appear":
+    matches_with_A = set(dff.loc[dff[team_col] == left_team, "match_id"].dropna().unique().tolist())
+    matches_with_B = set(dff.loc[dff[team_col] == right_team, "match_id"].dropna().unique().tolist())
+    common_matches = sorted(list(matches_with_A.intersection(matches_with_B)))
+    dff = dff[dff["match_id"].isin(common_matches)].copy()
+
+# --- Sequence summaries (effectiveness) ---
+seq_summary = summarise_sequences(dff, team_col=team_col)
+seq_summary_all = summarise_sequences(dff_all, team_col=team_col)
+
+# Ends for heatmaps
+ends, ends_warn = get_team_possession_ends(dff)
+if ends_warn:
+    st.warning(ends_warn)
+
+A_ends = ends[ends[team_col] == left_team].dropna(subset=["x_end", "y_end"])
+B_ends = ends[ends[team_col] == right_team].dropna(subset=["x_end", "y_end"])
+
+# --- Top metrics ---
+A_seq = seq_summary[seq_summary["team"] == left_team].dropna(subset=["end_x", "end_y"])
+B_seq = seq_summary[seq_summary["team"] == right_team].dropna(subset=["end_x", "end_y"])
+
+c1, c2, c3, c4 = st.columns(4)
+c1.metric("Matches in view", int(dff["match_id"].nunique()))
+c2.metric(f"{left_team} sequences", len(A_seq))
+c3.metric(f"{right_team} sequences", len(B_seq))
+c4.metric("KDE available", "Yes" if SCIPY_OK else "No (install scipy)")
+
+# --- Heatmaps ---
+st.subheader("Where possessions end (KDE heatmaps)")
+colA, colB = st.columns(2)
+
+with colA:
+    fig, ax = plt.subplots(figsize=(8, 5))
+    img = plot_kde(ax, A_ends["x_end"].values, A_ends["y_end"].values)
+    ax.set_title(f"{left_team} – Possession End KDE")
+    if img is not None:
+        plt.colorbar(img, ax=ax, fraction=0.046, pad=0.04)
+    st.pyplot(fig, use_container_width=True)
+
+with colB:
+    fig, ax = plt.subplots(figsize=(8, 5))
+    img = plot_kde(ax, B_ends["x_end"].values, B_ends["y_end"].values)
+    ax.set_title(f"{right_team} – Possession End KDE")
+    if img is not None:
+        plt.colorbar(img, ax=ax, fraction=0.046, pad=0.04)
+    st.pyplot(fig, use_container_width=True)
+
+# --- Effectiveness comparisons ---
+
+
+# --- Where possessions start and end (common areas) ---
+st.subheader("Most common areas for possessions to start vs end")
+
+st.caption(
+    "These plots use **team possession sequences** (one per sequence). "
+    "Start = first location in the sequence, End = last location in the sequence."
+)
+
+team_for_zones = st.radio("Team for start/end zones", [str(left_team), str(right_team), "Both"], horizontal=True)
+
+def plot_start_end_for_team(team_name: str):
+    seq = seq_summary[seq_summary["team"] == team_name].dropna(subset=["start_x", "start_y", "end_x", "end_y"])
+    c1, c2 = st.columns(2)
+    with c1:
+        fig, ax = plt.subplots(figsize=(7.5, 5))
+        img = plot_kde(ax, seq["start_x"].values, seq["start_y"].values)
+        ax.set_title(f"{team_name} – Sequence START locations (KDE)")
+        if img is not None:
+            plt.colorbar(img, ax=ax, fraction=0.046, pad=0.04)
+        st.pyplot(fig, use_container_width=True)
+    with c2:
+        fig, ax = plt.subplots(figsize=(7.5, 5))
+        img = plot_kde(ax, seq["end_x"].values, seq["end_y"].values)
+        ax.set_title(f"{team_name} – Sequence END locations (KDE)")
+        if img is not None:
+            plt.colorbar(img, ax=ax, fraction=0.046, pad=0.04)
+        st.pyplot(fig, use_container_width=True)
+
+if team_for_zones == "Both":
+    t1, t2 = st.tabs([str(left_team), str(right_team)])
+    with t1:
+        plot_start_end_for_team(str(left_team))
+    with t2:
+        plot_start_end_for_team(str(right_team))
+else:
+    plot_start_end_for_team(team_for_zones)
+
+st.subheader("Effectiveness of possession sequences (simple comparisons)")
+
+def safe_mean(s):
+    s = pd.to_numeric(s, errors="coerce")
+    return float(s.mean()) if len(s) else float("nan")
+
+def rate_true(s):
+    if len(s) == 0:
+        return float("nan")
+    return float(pd.Series(s).fillna(False).astype(bool).mean())
+
+def pct(cond):
+    return float(cond.mean()) if len(cond) else float("nan")
+
+# End-in-zone flags
+A_final_third = None
+B_final_third = None
+if "third_end" in A_seq.columns and A_seq["third_end"].notna().any():
+    # Heuristic: treat anything containing "Attacking" as final third
+    A_final_third = A_seq["third_end"].astype(str).str.contains("attacking", case=False, na=False)
+    B_final_third = B_seq["third_end"].astype(str).str.contains("attacking", case=False, na=False)
+
+A_pen = None
+B_pen = None
+if "penalty_area_end" in A_seq.columns and A_seq["penalty_area_end"].notna().any():
+    # penalty_area_end is often boolean
+    A_pen = A_seq["penalty_area_end"].fillna(False).astype(bool)
+    B_pen = B_seq["penalty_area_end"].fillna(False).astype(bool)
+
+# KPI row
+k1, k2, k3, k4, k5, k6 = st.columns(6)
+k1.metric(f"{left_team} shot rate", f"{100*rate_true(A_seq.get('lead_to_shot', False)):.1f}%")
+k2.metric(f"{right_team} shot rate", f"{100*rate_true(B_seq.get('lead_to_shot', False)):.1f}%")
+k3.metric(f"{left_team} avg duration", f"{safe_mean(A_seq['duration']):.2f}s")
+k4.metric(f"{right_team} avg duration", f"{safe_mean(B_seq['duration']):.2f}s")
+k5.metric(f"{left_team} avg x-prog", f"{safe_mean(A_seq['progression_x']):.2f}")
+k6.metric(f"{right_team} avg x-prog", f"{safe_mean(B_seq['progression_x']):.2f}")
+
+# Bar chart: key rates
+labels = ["Lead to shot", "Lead to goal"]
+A_rates = [rate_true(A_seq.get("lead_to_shot", False)), rate_true(A_seq.get("lead_to_goal", False))]
+B_rates = [rate_true(B_seq.get("lead_to_shot", False)), rate_true(B_seq.get("lead_to_goal", False))]
+
+if A_final_third is not None and B_final_third is not None:
+    labels.append("End in final third")
+    A_rates.append(pct(A_final_third))
+    B_rates.append(pct(B_final_third))
+
+if A_pen is not None and B_pen is not None:
+    labels.append("End in penalty area")
+    A_rates.append(pct(A_pen))
+    B_rates.append(pct(B_pen))
+
+x = np.arange(len(labels))
+width = 0.35
+fig, ax = plt.subplots(figsize=(10, 4.5))
+ax.bar(x - width/2, A_rates, width, label=str(left_team))
+ax.bar(x + width/2, B_rates, width, label=str(right_team))
+ax.set_xticks(x)
+ax.set_xticklabels(labels, rotation=15, ha="right")
+ax.set_ylim(0, max(0.01, np.nanmax(A_rates + B_rates) * 1.25))
+ax.set_ylabel("Rate")
+ax.legend()
+st.pyplot(fig, use_container_width=True)
+
+# Distribution: progression and duration
+dist_col1, dist_col2 = st.columns(2)
+
+with dist_col1:
+    fig, ax = plt.subplots(figsize=(6, 4))
+    ax.hist(A_seq["progression_x"].dropna().values, bins=30, alpha=0.6, label=str(left_team))
+    ax.hist(B_seq["progression_x"].dropna().values, bins=30, alpha=0.6, label=str(right_team))
+    ax.set_title("Distribution: x progression (end_x - start_x)")
+    ax.set_xlabel("x progression")
+    ax.set_ylabel("Count")
+    ax.legend()
+    st.pyplot(fig, use_container_width=True)
+
+with dist_col2:
+    fig, ax = plt.subplots(figsize=(6, 4))
+    ax.hist(A_seq["duration"].dropna().values, bins=30, alpha=0.6, label=str(left_team))
+    ax.hist(B_seq["duration"].dropna().values, bins=30, alpha=0.6, label=str(right_team))
+    ax.set_title("Distribution: sequence duration (sum of player possessions)")
+    ax.set_xlabel("seconds")
+    ax.set_ylabel("Count")
+    ax.legend()
+    st.pyplot(fig, use_container_width=True)
+
+# --- Player involvement ---
+
+# ============================================================
+# Advanced effectiveness dashboard (filters + multi-team charts)
+# ============================================================
+st.subheader("Who is most involved?")
+
+player_col = "player_name" if "player_name" in dff.columns else None
+if player_col is None:
+    st.info("No player_name column found, so player involvement charts are unavailable.")
+else:
+    p1, p2 = st.columns(2)
+
+    def player_involvement(team_name: str) -> pd.DataFrame:
+        dd = dff[dff[team_col] == team_name].dropna(subset=[player_col]).copy()
+
+        # Total involvements (count of player possessions)
+        # Use reset_index(name=...) to be robust across pandas versions.
+        total = (
+            dd[player_col]
+            .value_counts()
+            .reset_index(name="player_possessions")
+            .rename(columns={player_col: "player"})
+        )
+
+        # Unique sequences involved in
+        seqs = (
+            dd.groupby(player_col)["team_possession_seq"]
+            .nunique()
+            .reset_index(name="sequences_involved")
+            .rename(columns={player_col: "player"})
+        )
+
+        out = total.merge(seqs, on="player", how="left")
+        return out
+
+    A_inv = player_involvement(left_team)
+    B_inv = player_involvement(right_team)
+
+    with p1:
+        st.markdown(f"**Top players – {left_team}**")
+        topA = A_inv.head(12)
+        fig, ax = plt.subplots(figsize=(7, 4.5))
+        ax.barh(topA["player"][::-1], topA["player_possessions"][::-1])
+        ax.set_xlabel("Player possessions")
+        ax.set_ylabel("Player")
+        st.pyplot(fig, use_container_width=True)
+        st.dataframe(topA, use_container_width=True, hide_index=True)
+
+    with p2:
+        st.markdown(f"**Top players – {right_team}**")
+        topB = B_inv.head(12)
+        fig, ax = plt.subplots(figsize=(7, 4.5))
+        ax.barh(topB["player"][::-1], topB["player_possessions"][::-1])
+        ax.set_xlabel("Player possessions")
+        ax.set_ylabel("Player")
+        st.pyplot(fig, use_container_width=True)
+        st.dataframe(topB, use_container_width=True, hide_index=True)
+
+# --- Player combinations (passing links) ---
+
+
+# --- Player ball progression value (through thirds) ---
+st.subheader("Who adds the most ball progression through the thirds?")
+
+st.caption(
+    "Simple 'value' proxy: counts how often a player moves the ball from Defensive→Middle, Middle→Attacking (1 each), "
+    "or Defensive→Attacking (2). Boundaries are x=-17.5 and x=17.5 in your coordinate system."
+)
+
+if player_col is None:
+    st.info("No player_name column found, so progression-by-player is unavailable.")
+else:
+    def player_third_progression(team_name: str) -> pd.DataFrame:
+        dd = dff[dff[team_col] == team_name].dropna(subset=[player_col, "x_start", "y_start", "x_end", "y_end"]).copy()
+        dd["start_third"] = dd["x_start"].apply(label_third_from_x)
+        dd["end_third"] = dd["x_end"].apply(label_third_from_x)
+        dd["thirds_progressed"] = [thirds_progressed(s, e) for s, e in zip(dd["x_start"], dd["x_end"])]
+        dd["dx"] = (dd["x_end"] - dd["x_start"])
+
+        out = (
+            dd.groupby(player_col, as_index=False)
+            .agg(
+                player_possessions=(player_col, "size"),
+                thirds_progressed=("thirds_progressed", "sum"),
+                avg_thirds_progressed=("thirds_progressed", "mean"),
+                total_x_progression=("dx", "sum"),
+                avg_x_progression=("dx", "mean"),
+            )
+            .rename(columns={player_col: "player"})
+            .sort_values("thirds_progressed", ascending=False)
+        )
+        return out
+
+    pr1, pr2 = st.columns(2)
+    with pr1:
+        st.markdown(f"**Top ball progressors – {left_team}**")
+        progA = player_third_progression(left_team)
+        topA = progA.head(12)
+        if len(topA) == 0:
+            st.info("No player possessions under current filters.")
+        else:
+            fig, ax = plt.subplots(figsize=(7, 4.5))
+            ax.barh(topA["player"][::-1], topA["thirds_progressed"][::-1])
+            ax.set_xlabel("Total thirds progressed (proxy)")
+            ax.set_ylabel("Player")
+            st.pyplot(fig, use_container_width=True)
+            st.dataframe(topA, use_container_width=True, hide_index=True)
+
+    with pr2:
+        st.markdown(f"**Top ball progressors – {right_team}**")
+        progB = player_third_progression(right_team)
+        topB = progB.head(12)
+        if len(topB) == 0:
+            st.info("No player possessions under current filters.")
+        else:
+            fig, ax = plt.subplots(figsize=(7, 4.5))
+            ax.barh(topB["player"][::-1], topB["thirds_progressed"][::-1])
+            ax.set_xlabel("Total thirds progressed (proxy)")
+            ax.set_ylabel("Player")
+            st.pyplot(fig, use_container_width=True)
+            st.dataframe(topB, use_container_width=True, hide_index=True)
+
+
+
+
+# --- Player ball losses / turnovers ---
+st.subheader("Who loses the ball the most?")
+
+st.caption(
+    "This uses the best available loss/turnover indicator in your dataset. "
+    "If a dedicated turnover column isn't present, you may need to map event types to losses."
+)
+
+if player_col is None:
+    st.info("No player_name column found, so ball-loss analysis is unavailable.")
+else:
+    # Heuristic: pick a loss column if present
+    loss_candidates = [
+        "possession_lost", "lost_possession", "is_possession_lost",
+        "turnover", "is_turnover", "dispossessed", "is_dispossessed",
+        "ball_lost", "loss", "team_possession_loss_in_phase"
+    ]
+    loss_col = None
+    lower_cols = {c.lower(): c for c in dff.columns}
+    for cand in loss_candidates:
+        if cand in lower_cols:
+            loss_col = lower_cols[cand]
+            break
+
+    # Fallback: if event_type exists, look for common loss event labels
+    event_col = None
+    for cand in ["event_type", "type", "event_name"]:
+        if cand in dff.columns:
+            event_col = cand
+            break
+
+    dd_loss = dff[dff[team_col].isin([left_team, right_team])].copy()
+    dd_loss = dd_loss.dropna(subset=[player_col])
+
+    if loss_col is not None:
+        # Convert to boolean-ish
+        loss_flag = dd_loss[loss_col].fillna(False)
+        if loss_flag.dtype != bool:
+            # handle strings like "True"/"False"
+            loss_flag = loss_flag.astype(str).str.lower().isin(["true", "1", "yes", "y"])
+        dd_loss["_loss_flag"] = loss_flag
+        loss_source = f"Using column `{loss_col}` as the loss indicator."
+    elif event_col is not None:
+        # Basic mapping of event strings
+        ev = dd_loss[event_col].astype(str).str.lower()
+        dd_loss["_loss_flag"] = ev.str.contains("turnover|dispossess|miscontrol|lost|intercepted", regex=True)
+        loss_source = f"No explicit loss column found; using keyword match on `{event_col}`."
+    else:
+        dd_loss["_loss_flag"] = False
+        loss_source = "No loss indicator found (no suitable columns)."
+
+    st.info(loss_source)
+
+    def player_losses(team_name: str) -> pd.DataFrame:
+        t = dd_loss[dd_loss[team_col] == team_name].copy()
+        out = (
+            t.groupby(player_col, as_index=False)
+            .agg(
+                player_possessions=(player_col, "size"),
+                ball_losses=("_loss_flag", "sum"),
+            )
+            .rename(columns={player_col: "player"})
+        )
+        out["loss_rate"] = out["ball_losses"] / out["player_possessions"]
+        out = out.sort_values(["ball_losses", "loss_rate"], ascending=False)
+        return out
+
+    l1, l2 = st.columns(2)
+    with l1:
+        st.markdown(f"**{left_team} – most ball losses**")
+        LA = player_losses(left_team).head(15)
+        if len(LA) == 0:
+            st.info("No player possessions under current filters.")
+        else:
+            fig, ax = plt.subplots(figsize=(7, 4.5))
+            ax.barh(LA["player"][::-1], LA["ball_losses"][::-1])
+            ax.set_xlabel("Ball losses")
+            ax.set_ylabel("Player")
+            st.pyplot(fig, use_container_width=True)
+            st.dataframe(LA, use_container_width=True, hide_index=True)
+
+    with l2:
+        st.markdown(f"**{right_team} – most ball losses**")
+        LB = player_losses(right_team).head(15)
+        if len(LB) == 0:
+            st.info("No player possessions under current filters.")
+        else:
+            fig, ax = plt.subplots(figsize=(7, 4.5))
+            ax.barh(LB["player"][::-1], LB["ball_losses"][::-1])
+            ax.set_xlabel("Ball losses")
+            ax.set_ylabel("Player")
+            st.pyplot(fig, use_container_width=True)
+            st.dataframe(LB, use_container_width=True, hide_index=True)
+
+
+st.subheader("Which players combine the most? (pass links)")
+
+target_col = "player_targeted_name" if "player_targeted_name" in dff.columns else None
+if player_col is None or target_col is None:
+    st.info("No player_targeted_name column found, so combination charts are unavailable.")
+else:
+    st.caption("Uses rows where `player_targeted_name` is present (treated as a pass to that player).")
+
+    def top_links(team_name: str) -> pd.DataFrame:
+        dd = dff[dff[team_col] == team_name].copy()
+        dd = dd.dropna(subset=[player_col, target_col])
+
+        # Keep links within the same team roster (prevents odd links if present)
+        roster = set(dd[player_col].dropna().unique().tolist())
+        dd = dd[dd[target_col].isin(roster)]
+
+        dd = dd[dd[player_col] != dd[target_col]]
+
+        links = (
+            dd.groupby([player_col, target_col])
+            .size()
+            .rename("passes")
+            .reset_index()
+            .rename(columns={player_col: "from", target_col: "to"})
+            .sort_values("passes", ascending=False)
+        )
+
+        # Combine bidirectionally (A<->B) for "combination" view
+        a = links["from"].astype(str)
+        b = links["to"].astype(str)
+        links["pair"] = np.where(a < b, a + " ↔ " + b, b + " ↔ " + a)
+
+        combo = links.groupby("pair", as_index=False)["passes"].sum().sort_values("passes", ascending=False)
+        return combo
+
+    c1, c2 = st.columns(2)
+    with c1:
+        st.markdown(f"**Top combinations – {left_team}**")
+        comboA = top_links(left_team).head(15)
+        if len(comboA) == 0:
+            st.info("No pass links found under current filters.")
+        else:
+            fig, ax = plt.subplots(figsize=(7, 4.5))
+            ax.barh(comboA["pair"][::-1], comboA["passes"][::-1])
+            ax.set_xlabel("Pass links (both directions)")
+            ax.set_ylabel("Pair")
+            st.pyplot(fig, use_container_width=True)
+            st.dataframe(comboA, use_container_width=True, hide_index=True)
+
+    with c2:
+        st.markdown(f"**Top combinations – {right_team}**")
+        comboB = top_links(right_team).head(15)
+        if len(comboB) == 0:
+            st.info("No pass links found under current filters.")
+        else:
+            fig, ax = plt.subplots(figsize=(7, 4.5))
+            ax.barh(comboB["pair"][::-1], comboB["passes"][::-1])
+            ax.set_xlabel("Pass links (both directions)")
+            ax.set_ylabel("Pair")
+            st.pyplot(fig, use_container_width=True)
+            st.dataframe(comboB, use_container_width=True, hide_index=True)
+
+# --- Data table & download ---
+
+
+# --- Passing network (network-style graph) ---
+st.subheader("Passing network (who connects with who?)")
+
+if player_col is None or target_col is None:
+    st.info("No player_targeted_name column found, so passing networks are unavailable.")
+else:
+    with st.sidebar:
+        st.header("Network settings")
+        show_bg_heatmap = st.checkbox("Background heatmap behind network", value=True)
+        bg_heatmap_target = st.selectbox("Heatmap source", ["Possession end locations", "Possession start locations"], index=0)
+        min_link_weight = st.slider("Minimum links to show", min_value=1, max_value=20, value=3, step=1)
+        top_edges = st.slider("Max edges to draw", min_value=10, max_value=200, value=60, step=10)
+        overlay_on_pitch = st.checkbox("Overlay network on pitch", value=True)
+        loc_mode = st.selectbox("Player location", ["avg start location", "avg midpoint (start/end)"], index=0)
+        fallback_layout = st.selectbox("Fallback layout (if no locations)", ["spring", "circular"], index=0)
+
+    try:
+        import networkx as nx
+        NX_OK = True
+    except Exception:
+        NX_OK = False
+
+    if not NX_OK:
+        st.info("networkx is not installed (needed for passing networks). Install it via requirements.txt.")
+    else:
+        def build_pass_links(team_name: str) -> pd.DataFrame:
+            dd = dff[dff[team_col] == team_name].copy()
+            dd = dd.dropna(subset=[player_col, target_col])
+
+            roster = set(dd[player_col].dropna().unique().tolist())
+            dd = dd[dd[target_col].isin(roster)]
+            dd = dd[dd[player_col] != dd[target_col]]
+
+            links = (
+                dd.groupby([player_col, target_col])
+                .size()
+                .rename("w")
+                .reset_index()
+                .rename(columns={player_col: "from", target_col: "to"})
+                .sort_values("w", ascending=False)
             )
 
-        if show_zone_overlays:
-            add_zone_overlays(fig, attack_up=attack_up, flip_len=flip_direction, invert_width=invert_width)
+            links = links[links["w"] >= min_link_weight].head(top_edges)
+            return links
 
-        hover_cols = [c for c in ["Start Side", "Start Zone", "Player", "Recipient player", "Outcome", "Pass height", "Match", "Date", "Minute", "Second"] if c in f.columns]
-        def row_to_hover(row):
-            parts = []
-            for c in hover_cols:
-                v = row.get(c, "")
-                if pd.isna(v):
-                    continue
-                parts.append(f"<b>{c}</b>: {v}")
-            parts.append(f"<b>Start</b>: ({row['Start X']:.1f}, {row['Start Y']:.1f})")
-            parts.append(f"<b>End</b>: ({row['End X']:.1f}, {row['End Y']:.1f})")
-            return "<br>".join(parts)
+        def build_positions(team_name: str) -> dict:
+            dd = dff[dff[team_col] == team_name].copy()
+            dd = dd.dropna(subset=[player_col, "x_start", "y_start", "x_end", "y_end"])
 
-        hover_text = f.apply(row_to_hover, axis=1).to_list()
-        hover_arr = np.array(hover_text, dtype=object)
+            if loc_mode == "avg midpoint (start/end)":
+                dd["px"] = (dd["x_start"] + dd["x_end"]) / 2.0
+                dd["py"] = (dd["y_start"] + dd["y_end"]) / 2.0
+            else:
+                dd["px"] = dd["x_start"]
+                dd["py"] = dd["y_start"]
 
-        sx_s, sy_s, ex_s, ey_s = sx[success], sy[success], ex[success], ey[success]
-        sx_f, sy_f, ex_f, ey_f = sx[~success], sy[~success], ex[~success], ey[~success]
+            pos_df = dd.groupby(player_col)[["px", "py"]].mean().reset_index()
+            return {str(r[player_col]): (float(r["px"]), float(r["py"])) for _, r in pos_df.iterrows()}
 
-        if len(sx_s) > 0:
-            fig.add_trace(make_segment_trace(sx_s, sy_s, ex_s, ey_s, color="green"))
-        if len(sx_f) > 0:
-            fig.add_trace(make_segment_trace(sx_f, sy_f, ex_f, ey_f, color="red"))
+        def links_to_graph(links: pd.DataFrame) -> nx.DiGraph:
+            G = nx.DiGraph()
+            for _, r in links.iterrows():
+                G.add_edge(str(r["from"]), str(r["to"]), weight=float(r["w"]))
+            return G
 
-        if len(sx_s) > 0:
-            fig.add_trace(go.Scattergl(x=sx_s, y=sy_s, mode="markers",
-                                       marker=dict(size=7, opacity=0.85, color="green"),
-                                       hovertext=hover_arr[success], hoverinfo="text", showlegend=False))
-        if len(sx_f) > 0:
-            fig.add_trace(go.Scattergl(x=sx_f, y=sy_f, mode="markers",
-                                       marker=dict(size=7, opacity=0.85, color="red"),
-                                       hovertext=hover_arr[~success], hoverinfo="text", showlegend=False))
+        def draw_layout_graph(ax, G, title: str, layout: str):
+            ax.axis("off")
+            ax.set_title(title)
 
-        if show_endpoints and len(f) > 0:
-            fig.add_trace(go.Scattergl(x=ex, y=ey, mode="markers",
-                                       marker=dict(size=6, opacity=0.6, symbol="x"),
-                                       hoverinfo="skip", showlegend=False))
+            if G.number_of_nodes() == 0 or G.number_of_edges() == 0:
+                ax.text(0.5, 0.5, "No links under current filters", ha="center", va="center")
+                return
 
-        st.plotly_chart(fig, use_container_width=True)
+            if layout == "circular":
+                pos = nx.circular_layout(G)
+            else:
+                pos = nx.spring_layout(G, seed=7, k=0.7)
 
-        m1, m2, m3 = st.columns(3)
-        with m1: st.metric("Crosses", f"{len(f):,}")
-        with m2: st.metric("Completed", f"{int(success.sum()):,}")
-        with m3: st.metric("Completion %", f"{(100*success.mean() if len(success) else 0):.1f}%")
+            node_strength = {}
+            for n in G.nodes():
+                out_w = sum(d.get("weight", 1.0) for _, _, d in G.out_edges(n, data=True))
+                in_w = sum(d.get("weight", 1.0) for _, _, d in G.in_edges(n, data=True))
+                node_strength[n] = out_w + in_w
 
-        if show_table:
-            st.subheader("Filtered data")
-            st.dataframe(f, use_container_width=True, height=350)
+            strengths = np.array([node_strength[n] for n in G.nodes()], dtype=float)
+            sizes = 300 + 1200 * (strengths / strengths.max()) if strengths.max() > 0 else 400
 
-        st.download_button(
-            "Download filtered crosses CSV",
-            data=f.to_csv(index=False).encode("utf-8"),
-            file_name="filtered_crosses.csv",
-            mime="text/csv",
+            weights = np.array([d.get("weight", 1.0) for _, _, d in G.edges(data=True)], dtype=float)
+            widths = 0.5 + 4.0 * (weights / weights.max()) if weights.max() > 0 else 1.0
+
+            nx.draw_networkx_nodes(G, pos, ax=ax, node_size=sizes, alpha=0.9)
+            nx.draw_networkx_edges(G, pos, ax=ax, width=widths, arrows=True, arrowsize=12, alpha=0.6)
+            nx.draw_networkx_labels(G, pos, ax=ax, font_size=9)
+
+        def draw_pitch_overlay(ax, G, positions: dict, title: str, team_name: str):
+            # Optional background density heatmap
+            if show_bg_heatmap and SCIPY_OK:
+                src_x, src_y = ('x_end','y_end') if bg_heatmap_target.startswith('Possession end') else ('x_start','y_start')
+                ddh = dff[dff[team_col] == team_name].dropna(subset=[src_x, src_y]).copy()
+                if len(ddh) > 1:
+                    _, _, zz = kde_density_grid(ddh[src_x].values, ddh[src_y].values)
+                    ax.imshow(
+                        zz.T,
+                        origin='lower',
+                        extent=[-52.5, 52.5, -34, 34],
+                        alpha=0.35,
+                        aspect='equal'
+                    )
+            draw_pitch(ax)
+            ax.set_title(title)
+
+            if G.number_of_nodes() == 0 or G.number_of_edges() == 0:
+                ax.text(0, 0, "No links under current filters", ha="center", va="center")
+                return
+
+            # Keep only nodes that have positions
+            nodes_with_pos = {n for n in G.nodes() if n in positions}
+            if len(nodes_with_pos) < 2:
+                ax.text(0, 0, "Not enough player locations (try changing Player location setting)", ha="center", va="center")
+                return
+
+            # Node strength for sizing
+            node_strength = {}
+            for n in nodes_with_pos:
+                out_w = sum(d.get("weight", 1.0) for _, _, d in G.out_edges(n, data=True) if _ in nodes_with_pos or True)
+                in_w = sum(d.get("weight", 1.0) for _, _, d in G.in_edges(n, data=True) if _ in nodes_with_pos or True)
+                node_strength[n] = out_w + in_w
+
+            strengths = np.array([node_strength[n] for n in nodes_with_pos], dtype=float)
+            sizes = 80 + 520 * (strengths / strengths.max()) if strengths.max() > 0 else 200
+
+            # Edge widths
+            edges = [(u, v, d.get("weight", 1.0)) for u, v, d in G.edges(data=True) if u in nodes_with_pos and v in nodes_with_pos]
+            if not edges:
+                ax.text(0, 0, "No edges with player locations", ha="center", va="center")
+                return
+
+            weights = np.array([w for _, _, w in edges], dtype=float)
+            widths = 0.3 + 3.0 * (weights / weights.max()) if weights.max() > 0 else 1.0
+
+            # Draw edges as arrows
+            for (u, v, w), lw in zip(edges, widths):
+                x1, y1 = positions[u]
+                x2, y2 = positions[v]
+                ax.annotate(
+                    "",
+                    xy=(x2, y2),
+                    xytext=(x1, y1),
+                    arrowprops=dict(arrowstyle="->", lw=lw, alpha=0.55),
+                )
+
+            # Draw nodes + labels
+            xs = [positions[n][0] for n in nodes_with_pos]
+            ys = [positions[n][1] for n in nodes_with_pos]
+            ax.scatter(xs, ys, s=sizes, alpha=0.9)
+
+            for n in nodes_with_pos:
+                x, y = positions[n]
+                ax.text(x, y, n, fontsize=8, ha="center", va="center")
+
+        def make_team_network(team_name: str):
+            links = build_pass_links(team_name)
+            G = links_to_graph(links)
+            pos = build_positions(team_name) if overlay_on_pitch else {}
+            return G, links, pos
+
+        netA, linksA, posA = make_team_network(left_team)
+        netB, linksB, posB = make_team_network(right_team)
+
+        n1, n2 = st.columns(2)
+        with n1:
+            fig, ax = plt.subplots(figsize=(7, 6))
+            if overlay_on_pitch:
+                draw_pitch_overlay(ax, netA, posA, f"{left_team} passing network (pitch overlay)", str(left_team))
+            else:
+                draw_layout_graph(ax, netA, f"{left_team} passing network", layout=fallback_layout)
+            st.pyplot(fig, use_container_width=True)
+            with st.expander("Show edges table"):
+                st.dataframe(linksA, use_container_width=True, hide_index=True)
+
+        with n2:
+            fig, ax = plt.subplots(figsize=(7, 6))
+            if overlay_on_pitch:
+                draw_pitch_overlay(ax, netB, posB, f"{right_team} passing network (pitch overlay)", str(right_team))
+            else:
+                draw_layout_graph(ax, netB, f"{right_team} passing network", layout=fallback_layout)
+            st.pyplot(fig, use_container_width=True)
+            with st.expander("Show edges table"):
+                st.dataframe(linksB, use_container_width=True, hide_index=True)
+
+
+st.divider()
+st.subheader("Sequence table (one row per team possession sequence)")
+
+show_cols = ["match_id", "team_possession_seq", "team", "duration", "n_player_possessions", "progression_x", "lead_to_shot", "lead_to_goal"]
+for c in ["third_end", "penalty_area_end"]:
+    if c in seq_summary.columns:
+        show_cols.append(c)
+
+st.dataframe(seq_summary[show_cols].copy(), use_container_width=True, hide_index=True)
+
+csv_out = seq_summary.to_csv(index=False).encode("utf-8")
+st.download_button(
+    "Download sequence summary as CSV",
+    data=csv_out,
+    file_name="sequence_summary.csv",
+    mime="text/csv",
+)
+
+
+st.header("Effectiveness dashboard (all teams)")
+
+st.caption(
+    "This section compares possession-sequence effectiveness across teams using one-row-per-sequence data. "
+    "Filters apply at the **sequence level** (not individual player possessions)."
+)
+
+# --- Build sequence-level helper columns ---
+seq_eff = seq_summary_all.copy()
+
+# Add thirds labels for starts/ends (always available from x coords)
+seq_eff["start_third"] = seq_eff["start_x"].apply(label_third_from_x) if "start_x" in seq_eff.columns else "Unknown"
+seq_eff["end_third"] = seq_eff["end_x"].apply(label_third_from_x) if "end_x" in seq_eff.columns else "Unknown"
+seq_eff["thirds_progressed_seq"] = [thirds_progressed(s, e) for s, e in zip(seq_eff.get("start_x", np.nan), seq_eff.get("end_x", np.nan))]
+
+# --- Sequence-level filters ---
+with st.sidebar:
+    st.header("Effectiveness filters")
+
+    # Team selection for this section
+    eff_teams_all = sorted(seq_eff["team"].dropna().astype(str).unique().tolist())
+    eff_teams = st.multiselect("Teams to include (effectiveness)", eff_teams_all, default=eff_teams_all)
+
+    # Game state / score filters if present
+    gs_col = None
+    for cand in ["game_state", "gameState", "possession_game_state", "match_state"]:
+        if cand in seq_eff.columns:
+            gs_col = cand
+            break
+
+    score_diff_col = None
+    for cand in ["score_diff", "goal_diff", "score_difference", "scoreDelta"]:
+        if cand in seq_eff.columns:
+            score_diff_col = cand
+            break
+
+    # Time filters if present
+    minute_col = None
+    for cand in ["minute_start", "minute", "start_minute"]:
+        if cand in seq_eff.columns:
+            minute_col = cand
+            break
+
+# Apply filters
+if eff_teams:
+    seq_eff = seq_eff[seq_eff["team"].astype(str).isin([str(t) for t in eff_teams])].copy()
+
+# Game state filter
+if gs_col is not None:
+    with st.sidebar:
+        gs_opts = ["All"] + sorted([x for x in seq_eff[gs_col].dropna().unique().tolist()])
+        gs_choice = st.selectbox("Game state", gs_opts, index=0)
+    if gs_choice != "All":
+        seq_eff = seq_eff[seq_eff[gs_col] == gs_choice].copy()
+else:
+    with st.sidebar:
+        st.caption("Game state filter: column not found (skipping).")
+
+# Score diff filter
+if score_diff_col is not None:
+    seq_eff[score_diff_col] = pd.to_numeric(seq_eff[score_diff_col], errors="coerce")
+    with st.sidebar:
+        sd_min = float(np.nanmin(seq_eff[score_diff_col].values)) if len(seq_eff) else -3.0
+        sd_max = float(np.nanmax(seq_eff[score_diff_col].values)) if len(seq_eff) else 3.0
+        # keep sane bounds
+        sd_min = min(sd_min, 0.0)
+        sd_max = max(sd_max, 0.0)
+        sd_range = st.slider("Score diff range", min_value=float(sd_min), max_value=float(sd_max), value=(float(sd_min), float(sd_max)))
+    seq_eff = seq_eff[(seq_eff[score_diff_col] >= sd_range[0]) & (seq_eff[score_diff_col] <= sd_range[1])].copy()
+else:
+    with st.sidebar:
+        st.caption("Score-diff filter: column not found (skipping).")
+
+# Minute range filter
+if minute_col is not None:
+    seq_eff[minute_col] = pd.to_numeric(seq_eff[minute_col], errors="coerce")
+    with st.sidebar:
+        m_min = int(np.nanmin(seq_eff[minute_col].values)) if len(seq_eff) else 0
+        m_max = int(np.nanmax(seq_eff[minute_col].values)) if len(seq_eff) else 90
+        m_range = st.slider("Minute range", min_value=int(m_min), max_value=int(m_max), value=(int(m_min), int(m_max)))
+    seq_eff = seq_eff[(seq_eff[minute_col] >= m_range[0]) & (seq_eff[minute_col] <= m_range[1])].copy()
+else:
+    with st.sidebar:
+        st.caption("Minute filter: column not found (skipping).")
+
+# Start/end third filters
+with st.sidebar:
+    st.subheader("Location filters (sequence-level)")
+    start_third_choice = st.multiselect("Start third", ["Defensive", "Middle", "Attacking"], default=["Defensive", "Middle", "Attacking"])
+    end_third_choice = st.multiselect("End third", ["Defensive", "Middle", "Attacking"], default=["Defensive", "Middle", "Attacking"])
+    min_thirds_prog = st.slider("Min thirds progressed", min_value=0, max_value=2, value=0)
+
+seq_eff = seq_eff[seq_eff["start_third"].isin(start_third_choice)].copy()
+seq_eff = seq_eff[seq_eff["end_third"].isin(end_third_choice)].copy()
+seq_eff = seq_eff[seq_eff["thirds_progressed_seq"] >= min_thirds_prog].copy()
+
+# Optional: filter by in-possession phase type if present (sequence-level best-effort)
+if "team_in_possession_phase_type" in dff_all.columns:
+    with st.sidebar:
+        phase_seq_opts = ["All"] + sorted([x for x in dff_all["team_in_possession_phase_type"].dropna().unique().tolist()])
+        phase_seq_choice = st.selectbox("Phase (in-possession)", phase_seq_opts, index=0)
+    if phase_seq_choice != "All":
+        # Approx: keep sequences that contain at least one row with this phase type
+        keep = (
+            dff_all[dff_all["team_in_possession_phase_type"] == phase_seq_choice][["match_id", "team_possession_seq"]]
+            .dropna()
+            .drop_duplicates()
         )
+        seq_eff = seq_eff.merge(keep, on=["match_id", "team_possession_seq"], how="inner")
 
-    with tab_team:
+# --- Summary table: effectiveness per team ---
+def team_effectiveness_table(d: pd.DataFrame) -> pd.DataFrame:
+    if len(d) == 0:
+        return pd.DataFrame(columns=["team", "sequences", "shot_rate", "goal_rate", "avg_duration", "avg_x_prog", "end_final_third_rate", "end_pen_area_rate"])
 
-        st.subheader("Player profiles: progression vs chance creation")
+    out = d.groupby("team", as_index=False).agg(
+        sequences=("team", "size"),
+        shot_rate=("lead_to_shot", lambda s: pd.Series(s).fillna(False).astype(bool).mean()),
+        goal_rate=("lead_to_goal", lambda s: pd.Series(s).fillna(False).astype(bool).mean()),
+        avg_duration=("duration", "mean"),
+        avg_x_prog=("progression_x", "mean"),
+        avg_thirds_progressed=("thirds_progressed_seq", "mean"),
+    )
 
-        prof = compute_player_profiles(df)
-        if not prof.empty:
-            figp = px.scatter(
-                prof,
-                x="progression",
-                y="xa_proxy",
-                text="Player",
-                size="events",
-                title="Player Profiles: Progression (xT proxy) vs Chance Creation (xA proxy)",
-            )
-            figp.update_traces(textposition="top center")
-            figp.update_layout(
-                xaxis_title="Progression (xT proxy)",
-                yaxis_title="Chance Creation (xA proxy)",
-            )
-            st.plotly_chart(figp, use_container_width=True)
+    # End zone rates if present
+    if "third_end" in d.columns and d["third_end"].notna().any():
+        out["end_final_third_rate"] = d.groupby("team")["third_end"].apply(lambda s: s.astype(str).str.contains("attacking", case=False, na=False).mean()).values
+    else:
+        out["end_final_third_rate"] = np.nan
 
-        st.subheader("Team-by-Team Comparison")
-        metric = st.selectbox("Metric", [
-            "possessions","shot_poss_pct","box_poss_pct","xg_per_poss","passes_per_poss",
-            "duration_s","meters_progressed","directness","counter_poss_pct"
-        ], index=1)
+    if "penalty_area_end" in d.columns and d["penalty_area_end"].notna().any():
+        out["end_pen_area_rate"] = d.groupby("team")["penalty_area_end"].apply(lambda s: pd.Series(s).fillna(False).astype(bool).mean()).values
+    else:
+        out["end_pen_area_rate"] = np.nan
 
-        plot_df = poss_team.sort_values(metric, ascending=False)
-        fig = px.bar(plot_df, x="Team", y=metric, title=f"Teams — {metric.replace('_',' ')}")
-        fig.update_layout(xaxis_tickangle=-45)
-        st.plotly_chart(fig, use_container_width=True)
+    return out.sort_values("sequences", ascending=False)
 
-        fig2 = px.scatter(
-            poss_team,
-            x="passes_per_poss",
-            y="xg_per_poss",
-            size="possessions",
-            hover_name="Team",
-            title="Speed vs Control: passes/possession vs xG/possession",
+team_tbl = team_effectiveness_table(seq_eff)
+
+kpi1, kpi2, kpi3 = st.columns(3)
+kpi1.metric("Teams in view", int(team_tbl["team"].nunique()) if len(team_tbl) else 0)
+kpi2.metric("Sequences in view", int(seq_eff.shape[0]))
+kpi3.metric("Avg thirds progressed (all)", f"{seq_eff['thirds_progressed_seq'].mean():.2f}" if len(seq_eff) else "—")
+
+tabs = st.tabs(["Overview", "Shot & territory", "Progression & tempo", "Start vs end geography"])
+
+with tabs[0]:
+    st.subheader("Team effectiveness table")
+    st.dataframe(team_tbl, use_container_width=True, hide_index=True)
+
+    if len(team_tbl) == 0:
+        st.info("No sequences available under current effectiveness filters.")
+    else:
+        st.subheader("Quick leaderboard")
+        metric_key = st.selectbox(
+            "Leaderboard metric",
+            ["shot_rate", "goal_rate", "avg_duration", "avg_x_prog", "avg_thirds_progressed"],
+            index=0,
         )
-        st.plotly_chart(fig2, use_container_width=True)
+        metric_label_map = {
+            "shot_rate": "Shot rate",
+            "goal_rate": "Goal rate",
+            "avg_duration": "Avg duration",
+            "avg_x_prog": "Avg x progression",
+            "avg_thirds_progressed": "Avg thirds progressed",
+        }
+        metric_label = metric_label_map.get(metric_key, metric_key)
 
-        st.subheader("Percentile ranks (0–100)")
-        show_cols = ["Team"] + [c for c in poss_team_ranks.columns if c.endswith("_pctile")]
-        st.dataframe(poss_team_ranks[show_cols], use_container_width=True)
+        fig, ax = plt.subplots(figsize=(10, 5))
+        plot_df = team_tbl.sort_values(metric_key, ascending=False).copy()
+        ax.bar(plot_df["team"].astype(str), plot_df[metric_key].astype(float))
+        ax.set_title(f"Teams by {metric_label}")
+        ax.set_ylabel(metric_label)
+        ax.set_xticklabels(plot_df["team"].astype(str), rotation=20, ha="right")
+        st.pyplot(fig, use_container_width=True)
 
-        st.download_button(
-            "Download team metrics CSV",
-            data=poss_team.to_csv(index=False).encode("utf-8"),
-            file_name="team_possession_metrics.csv",
-            mime="text/csv",
+with tabs[1]:
+    st.subheader("Shot & territory")
+    if len(team_tbl) == 0:
+        st.info("No sequences available under current effectiveness filters.")
+    else:
+        # Shot / goal rates + territory proxies (final third / box if available)
+        cols = st.columns(2)
+        with cols[0]:
+            fig, ax = plt.subplots(figsize=(10, 4.5))
+            plot_df = team_tbl.sort_values("shot_rate", ascending=False).copy()
+            ax.bar(plot_df["team"].astype(str), plot_df["shot_rate"].astype(float))
+            ax.set_title("Shot rate by team")
+            ax.set_ylabel("Shot rate")
+            ax.set_xticklabels(plot_df["team"].astype(str), rotation=20, ha="right")
+            st.pyplot(fig, use_container_width=True)
+
+        with cols[1]:
+            fig, ax = plt.subplots(figsize=(10, 4.5))
+            plot_df = team_tbl.sort_values("goal_rate", ascending=False).copy()
+            ax.bar(plot_df["team"].astype(str), plot_df["goal_rate"].astype(float))
+            ax.set_title("Goal rate by team")
+            ax.set_ylabel("Goal rate")
+            ax.set_xticklabels(plot_df["team"].astype(str), rotation=20, ha="right")
+            st.pyplot(fig, use_container_width=True)
+
+        # Territory: end in final third / penalty area (if available)
+        terr_cols = [c for c in ["end_final_third_rate", "end_pen_area_rate"] if c in team_tbl.columns and team_tbl[c].notna().any()]
+        if terr_cols:
+            for c in terr_cols:
+                fig, ax = plt.subplots(figsize=(10, 4.5))
+                plot_df = team_tbl.sort_values(c, ascending=False).copy()
+                ax.bar(plot_df["team"].astype(str), plot_df[c].astype(float))
+                ax.set_title(f"{c.replace('_', ' ').title()} by team")
+                ax.set_ylabel("Rate")
+                ax.set_xticklabels(plot_df["team"].astype(str), rotation=20, ha="right")
+                st.pyplot(fig, use_container_width=True)
+        else:
+            st.info("Territory end-zone rates not available in this dataset/filters.")
+
+with tabs[2]:
+    st.subheader("Progression & tempo")
+    if len(team_tbl) == 0:
+        st.info("No sequences available under current effectiveness filters.")
+    else:
+        cols = st.columns(2)
+        with cols[0]:
+            fig, ax = plt.subplots(figsize=(10, 4.5))
+            plot_df = team_tbl.sort_values("avg_x_prog", ascending=False).copy()
+            ax.bar(plot_df["team"].astype(str), plot_df["avg_x_prog"].astype(float))
+            ax.set_title("Average x progression by team")
+            ax.set_ylabel("Avg x progression")
+            ax.set_xticklabels(plot_df["team"].astype(str), rotation=20, ha="right")
+            st.pyplot(fig, use_container_width=True)
+
+        with cols[1]:
+            fig, ax = plt.subplots(figsize=(10, 4.5))
+            plot_df = team_tbl.sort_values("avg_duration", ascending=False).copy()
+            ax.bar(plot_df["team"].astype(str), plot_df["avg_duration"].astype(float))
+            ax.set_title("Average sequence duration by team")
+            ax.set_ylabel("Seconds")
+            ax.set_xticklabels(plot_df["team"].astype(str), rotation=20, ha="right")
+            st.pyplot(fig, use_container_width=True)
+
+        fig, ax = plt.subplots(figsize=(10, 4.5))
+        plot_df = team_tbl.sort_values("avg_thirds_progressed", ascending=False).copy()
+        ax.bar(plot_df["team"].astype(str), plot_df["avg_thirds_progressed"].astype(float))
+        ax.set_title("Average thirds progressed by team")
+        ax.set_ylabel("Thirds progressed (avg)")
+        ax.set_xticklabels(plot_df["team"].astype(str), rotation=20, ha="right")
+        st.pyplot(fig, use_container_width=True)
+
+with tabs[3]:
+    st.subheader("Start vs end geography (filtered sequences)")
+    if len(seq_eff) < 2:
+        st.info("Not enough sequences under current filters to draw KDE maps.")
+    else:
+        tcols = st.columns(2)
+        with tcols[0]:
+            fig, ax = plt.subplots(figsize=(8, 5))
+            img = plot_kde(ax, seq_eff["start_x"].dropna().values, seq_eff["start_y"].dropna().values)
+            ax.set_title("START locations (all selected teams)")
+            if img is not None:
+                plt.colorbar(img, ax=ax, fraction=0.046, pad=0.04)
+            st.pyplot(fig, use_container_width=True)
+
+        with tcols[1]:
+            fig, ax = plt.subplots(figsize=(8, 5))
+            img = plot_kde(ax, seq_eff["end_x"].dropna().values, seq_eff["end_y"].dropna().values)
+            ax.set_title("END locations (all selected teams)")
+            if img is not None:
+                plt.colorbar(img, ax=ax, fraction=0.046, pad=0.04)
+            st.pyplot(fig, use_container_width=True)
+
+# ==============================
+# Player attacking impact (xT/xA/value)
+# ==============================
+st.divider()
+st.header("Player attacking impact & value (xT / xA / role-adjusted)")
+
+with st.expander("Show player value dashboards", expanded=True):
+    st.caption("Uses the uploaded player-value CSV tables (xT/xA per 100 possessions, role-adjusted value, and net negative value).")
+
+    # Load tables (repo-relative defaults)
+    # If you prefer uploads instead of shipping CSVs in the repo, add file_uploaders here and pass them to load_value_table().
+    xt_tbl = load_value_table("data/Top_progression__xT__per_100_possessions.csv")
+    xa_tbl = load_value_table("data/Top_chance_creators__xA__per_100_possessions.csv")
+    best_tbl = load_value_table("data/Best_role-adjusted_attacking_value__per_100_possessions_.csv")
+    worst_tbl = load_value_table("data/Worst_role-adjusted_attacking_value__per_100_possessions_.csv")
+    neg_tbl = load_value_table("data/Net_negative_total_attacking_value__sample_filtered_.csv")
+
+    if xt_tbl.empty and xa_tbl.empty and best_tbl.empty and worst_tbl.empty and neg_tbl.empty:
+        st.info("Player value tables not found. Ensure the CSVs are present in the repo under /data or add upload controls.")
+    else:
+        mu_team = _infer_mu_team_name(xt_tbl if not xt_tbl.empty else (xa_tbl if not xa_tbl.empty else best_tbl))
+        scope = st.radio(
+            "Scope",
+            ["Manchester United Women only", "All teams"],
+            index=0,
+            horizontal=True,
         )
+        top_n = st.slider("Top N to display", min_value=5, max_value=25, value=10, step=1)
 
-    with tab_poss_eff:
-        st.subheader("Possession Effectiveness (Inferred)")
+        # Build a unified “profiles” table from xT/xA (they share the same schema in your exports)
+        profiles = xt_tbl.copy() if not xt_tbl.empty else xa_tbl.copy()
+        # Ensure numeric columns exist (common in your exports)
+        for c in ["possessions", "prog_per100pos", "xa_per100pos", "xg_per100pos", "total_per100pos"]:
+            if c in profiles.columns:
+                profiles[c] = pd.to_numeric(profiles[c], errors="coerce")
 
-        cross_only = st.toggle("Analyse crossing possessions only", value=False)
-        poss_focus = poss_df.copy()
-        if cross_only:
-            poss_focus = poss_focus[poss_focus["has_cross"] == 1]
+        # Filters
+        role_opts = sorted(profiles["role_label"].dropna().astype(str).unique().tolist()) if "role_label" in profiles.columns else []
+        roles_sel = st.multiselect("Role filter", role_opts, default=role_opts) if role_opts else []
+        min_poss = 0
+        if "possessions" in profiles.columns and profiles["possessions"].notna().any():
+            max_poss = int(np.nanmax(profiles["possessions"].values))
+            min_poss = st.slider("Minimum possessions", 0, max(1, max_poss), value=min(50, max_poss))
+        else:
+            max_poss = None
 
-        st.markdown("**Possession outcomes** (share of possessions)")
-        out_pct_cols = [c for c in poss_out.columns if c.endswith("_pct")]
-        if out_pct_cols:
-            melt = poss_out.melt(id_vars=["Team"], value_vars=out_pct_cols, var_name="Outcome", value_name="Pct")
-            melt["Outcome"] = melt["Outcome"].str.replace("_pct","", regex=False)
-            fig = px.bar(melt, x="Team", y="Pct", color="Outcome", barmode="stack",
-                         title="Possession outcome distribution (%)")
-            fig.update_layout(xaxis_tickangle=-45)
-            st.plotly_chart(fig, use_container_width=True)
+        def apply_filters(df_in: pd.DataFrame) -> pd.DataFrame:
+            df_out = df_in.copy()
+            if scope == "Manchester United Women only" and mu_team and "team_name" in df_out.columns:
+                df_out = df_out[df_out["team_name"].astype(str) == str(mu_team)]
+            if roles_sel and "role_label" in df_out.columns:
+                df_out = df_out[df_out["role_label"].astype(str).isin([str(r) for r in roles_sel])]
+            if "possessions" in df_out.columns and min_poss and min_poss > 0:
+                df_out = df_out[pd.to_numeric(df_out["possessions"], errors="coerce").fillna(0) >= min_poss]
+            return df_out
 
-        # Team focus from subset
-        team_focus = poss_team.copy()
-        if cross_only:
-            team_focus = poss_focus.groupby("Team").agg(
-                possessions=("possession_id","nunique"),
-                shot_poss_pct=("has_shot", lambda x: 100*x.mean()),
-                box_poss_pct=("has_box", lambda x: 100*x.mean()),
-                xg_per_poss=("xg_sum", lambda x: np.nan if x.isna().all() else x.sum()/max(len(x),1)),
-                passes_per_poss=("events","mean"),
-                duration_s=("duration","mean"),
-                meters_progressed=("progressed","mean"),
-                directness=("directness","mean"),
-                counter_poss_pct=("is_counter", lambda x: 100*x.mean()),
-            ).reset_index()
+        profiles_f = apply_filters(profiles)
+        best_f = apply_filters(best_tbl) if not best_tbl.empty else best_tbl
+        worst_f = apply_filters(worst_tbl) if not worst_tbl.empty else worst_tbl
+        neg_f = apply_filters(neg_tbl) if not neg_tbl.empty else neg_tbl
 
-        fig3 = px.scatter(
-            team_focus,
-            x="shot_poss_pct",
-            y="xg_per_poss",
-            size="possessions",
-            hover_name="Team",
-            title="Shot-ending % vs xG per possession (size=possessions)",
-        )
-        st.plotly_chart(fig3, use_container_width=True)
+        tabs = st.tabs(["Profiles (xT vs xA)", "Leaderboards", "Role-adjusted value", "Negative value"])
 
-        st.markdown("**Counter-attacks (heuristic)**: duration ≤ 10s, progressed ≥ 25m, events ≤ 6")
-        fig4 = px.bar(team_focus.sort_values("counter_poss_pct", ascending=False),
-                      x="Team", y="counter_poss_pct", title="Counter-attack possessions (%)")
-        fig4.update_layout(xaxis_tickangle=-45)
-        st.plotly_chart(fig4, use_container_width=True)
+        with tabs[0]:
+            st.subheader("Player profiles: progression (xT proxy) vs chance creation (xA)")
+            if profiles_f.empty or "prog_per100pos" not in profiles_f.columns or "xa_per100pos" not in profiles_f.columns:
+                st.info("Profiles table is missing required columns (prog_per100pos / xa_per100pos).")
+            else:
+                fig, ax = plt.subplots(figsize=(8.5, 6))
+                x = pd.to_numeric(profiles_f["prog_per100pos"], errors="coerce")
+                y = pd.to_numeric(profiles_f["xa_per100pos"], errors="coerce")
+                s = None
+                if "possessions" in profiles_f.columns:
+                    s = pd.to_numeric(profiles_f["possessions"], errors="coerce").fillna(0).values
+                    # scale marker sizes gently
+                    s = 10 + (s / (np.nanmax(s) + 1e-9)) * 90
+                ax.scatter(x, y, s=s, alpha=0.75)
 
-        st.markdown("**Possession flow (Sankey)**")
-        nodes = ["Build", "Cross", "No Cross", "Box Entry", "No Box Entry", "Shot", "No Shot"]
-        node_index = {n:i for i,n in enumerate(nodes)}
-        sources, targets, values = [], [], []
-        for _, r in sankey_counts.iterrows():
-            c = int(r["count"])
-            if c <= 0:
-                continue
-            sources += [node_index[r["stage1"]], node_index[r["stage2"]], node_index[r["stage3"]]]
-            targets += [node_index[r["stage2"]], node_index[r["stage3"]], node_index[r["stage4"]]]
-            values  += [c, c, c]
+                # Median lines (helps interpretation without needing colours)
+                ax.axvline(np.nanmedian(x.values), linestyle="--", linewidth=1)
+                ax.axhline(np.nanmedian(y.values), linestyle="--", linewidth=1)
 
-        sank = go.Figure(data=[go.Sankey(
-            node=dict(label=nodes, pad=12, thickness=15),
-            link=dict(source=sources, target=targets, value=values),
-        )])
-        sank.update_layout(margin=dict(l=10,r=10,t=10,b=10))
-        st.plotly_chart(sank, use_container_width=True)
+                ax.set_xlabel("Progression value per 100 possessions (prog_per100pos)")
+                ax.set_ylabel("Chance creation per 100 possessions (xa_per100pos)")
+                ax.set_title("xT vs xA style profile (per 100 possessions)")
 
-        st.subheader("Team possession metrics (focus)")
-        st.dataframe(team_focus.sort_values("xg_per_poss", ascending=False), use_container_width=True)
-        st.download_button(
-            "Download team focus CSV",
-            data=team_focus.to_csv(index=False).encode("utf-8"),
-            file_name="team_possession_focus.csv",
-            mime="text/csv",
-        )
+                # Annotate MU points (if all teams view)
+                if scope == "All teams" and mu_team and "team_name" in profiles_f.columns and "player_name" in profiles_f.columns:
+                    mu_pts = profiles_f[profiles_f["team_name"].astype(str) == str(mu_team)]
+                    for _, r in mu_pts.iterrows():
+                        ax.annotate(str(r["player_name"]), (float(r["prog_per100pos"]), float(r["xa_per100pos"])), fontsize=8, alpha=0.9)
+
+                st.pyplot(fig, use_container_width=True)
+
+                # Optional: pick a player and show their row
+                if "player_name" in profiles_f.columns:
+                    player_pick = st.selectbox("Inspect a player", sorted(profiles_f["player_name"].astype(str).unique().tolist()))
+                    st.dataframe(profiles_f[profiles_f["player_name"].astype(str) == str(player_pick)], use_container_width=True, hide_index=True)
+
+        with tabs[1]:
+            st.subheader("Leaderboards")
+            c1, c2 = st.columns(2)
+            with c1:
+                if not profiles_f.empty and "player_name" in profiles_f.columns and "prog_per100pos" in profiles_f.columns:
+                    fig, ax = plt.subplots(figsize=(7, 5))
+                    barh_rank(ax, profiles_f, "player_name", "prog_per100pos", f"Top {top_n} progressors (per 100)", top_n=top_n)
+                    st.pyplot(fig, use_container_width=True)
+                else:
+                    st.info("Missing progressor columns in profiles table.")
+
+            with c2:
+                if not profiles_f.empty and "player_name" in profiles_f.columns and "xa_per100pos" in profiles_f.columns:
+                    fig, ax = plt.subplots(figsize=(7, 5))
+                    barh_rank(ax, profiles_f, "player_name", "xa_per100pos", f"Top {top_n} chance creators (per 100)", top_n=top_n)
+                    st.pyplot(fig, use_container_width=True)
+                else:
+                    st.info("Missing chance creation columns in profiles table.")
+
+            if not profiles_f.empty and "player_name" in profiles_f.columns and "total_per100pos" in profiles_f.columns:
+                fig, ax = plt.subplots(figsize=(7, 5))
+                barh_rank(ax, profiles_f, "player_name", "total_per100pos", f"Top {top_n} total attacking value (per 100)", top_n=top_n)
+                st.pyplot(fig, use_container_width=True)
+
+        with tabs[2]:
+            st.subheader("Role-adjusted attacking value (per 100 possessions)")
+            c1, c2 = st.columns(2)
+
+            with c1:
+                if not best_f.empty and "player_name" in best_f.columns:
+                    # Prefer role_adjusted_total100 if present
+                    val_col = "role_adjusted_total100" if "role_adjusted_total100" in best_f.columns else ("total_per100pos" if "total_per100pos" in best_f.columns else None)
+                    if val_col:
+                        fig, ax = plt.subplots(figsize=(7, 5))
+                        barh_rank(ax, best_f, "player_name", val_col, f"Best role-adjusted value (Top {top_n})", top_n=top_n)
+                        st.pyplot(fig, use_container_width=True)
+                    else:
+                        st.info("Best table missing value columns.")
+                else:
+                    st.info("Best role-adjusted table unavailable.")
+
+            with c2:
+                if not worst_f.empty and "player_name" in worst_f.columns:
+                    val_col = "role_adjusted_total100" if "role_adjusted_total100" in worst_f.columns else ("total_per100pos" if "total_per100pos" in worst_f.columns else None)
+                    if val_col:
+                        fig, ax = plt.subplots(figsize=(7, 5))
+                        # ascending=True for 'worst'
+                        barh_rank(ax, worst_f, "player_name", val_col, f"Worst role-adjusted value (Bottom {top_n})", top_n=top_n, ascending=True)
+                        st.pyplot(fig, use_container_width=True)
+                    else:
+                        st.info("Worst table missing value columns.")
+                else:
+                    st.info("Worst role-adjusted table unavailable.")
+
+        with tabs[3]:
+            st.subheader("Net negative attacking value (volume)")
+            if neg_f.empty:
+                st.info("Negative value table unavailable.")
+            else:
+                # total_attacking_value is negative in this export (net negative total)
+                val_col = "total_attacking_value" if "total_attacking_value" in neg_f.columns else None
+                if val_col and "player_name" in neg_f.columns:
+                    fig, ax = plt.subplots(figsize=(8, 5))
+                    d = neg_f.copy()
+                    d[val_col] = pd.to_numeric(d[val_col], errors="coerce")
+                    d = d.dropna(subset=[val_col]).sort_values(val_col, ascending=True).head(top_n)
+                    ax.barh(d["player_name"].astype(str).values[::-1], d[val_col].values[::-1])
+                    ax.set_title(f"Most negative total attacking value (Top {top_n})")
+                    ax.set_xlabel(val_col)
+                    st.pyplot(fig, use_container_width=True)
+
+                st.dataframe(neg_f, use_container_width=True, hide_index=True)
+
+        # Optional link to your existing passing network section (best-effort)
+        st.caption("Tip: use the player picker above to cross-check passing network + possession outcomes for the same player in other sections.")
 
