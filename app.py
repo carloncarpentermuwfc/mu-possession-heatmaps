@@ -294,6 +294,62 @@ st.caption(
     "plus simple effectiveness metrics and player involvement / combinations."
 )
 
+
+# --- Player value tables (external CSVs) ---
+@st.cache_data(show_spinner=False)
+def load_value_table(rel_path: str, uploaded_file=None) -> pd.DataFrame:
+    """
+    Load a player-value table either from a repo-relative path (recommended for Streamlit Cloud)
+    or from an uploaded file.
+    """
+    df = None
+    if uploaded_file is not None:
+        try:
+            df = pd.read_csv(uploaded_file)
+        except Exception:
+            df = None
+
+    if df is None:
+        p = os.path.join(os.path.dirname(__file__), rel_path)
+        if os.path.exists(p):
+            df = pd.read_csv(p)
+        else:
+            return pd.DataFrame()
+
+    # Clean common artifacts
+    for c in ["Unnamed: 0", "Unnamed:0"]:
+        if c in df.columns:
+            df = df.drop(columns=[c])
+
+    # Standardise key column names (keep original if present)
+    rename_map = {
+        "player": "player_name",
+        "team": "team_name",
+        "role": "role_label",
+    }
+    for a, b in rename_map.items():
+        if a in df.columns and b not in df.columns:
+            df = df.rename(columns={a: b})
+
+    return df
+
+def _infer_mu_team_name(value_df: pd.DataFrame) -> str | None:
+    if "team_name" not in value_df.columns or value_df.empty:
+        return None
+    teams = value_df["team_name"].dropna().astype(str).unique().tolist()
+    for t in teams:
+        tl = t.lower()
+        if "manchester united" in tl or "man utd" in tl or "man united" in tl:
+            return t
+    return None
+
+def barh_rank(ax, df: pd.DataFrame, label_col: str, value_col: str, title: str, top_n: int = 10, ascending: bool = False):
+    d = df[[label_col, value_col]].dropna().copy()
+    d[value_col] = pd.to_numeric(d[value_col], errors="coerce")
+    d = d.dropna(subset=[value_col]).sort_values(value_col, ascending=ascending).head(top_n) if ascending else d.sort_values(value_col, ascending=False).head(top_n)
+    ax.barh(d[label_col].astype(str).values[::-1], d[value_col].values[::-1])
+    ax.set_title(title)
+    ax.set_xlabel(value_col)
 default_path = os.path.join("data", "possessions.csv")
 df = None
 
@@ -1491,3 +1547,179 @@ with tabs[3]:
             if img is not None:
                 plt.colorbar(img, ax=ax, fraction=0.046, pad=0.04)
             st.pyplot(fig, use_container_width=True)
+
+# ==============================
+# Player attacking impact (xT/xA/value)
+# ==============================
+st.divider()
+st.header("Player attacking impact & value (xT / xA / role-adjusted)")
+
+with st.expander("Show player value dashboards", expanded=True):
+    st.caption("Uses the uploaded player-value CSV tables (xT/xA per 100 possessions, role-adjusted value, and net negative value).")
+
+    # Load tables (repo-relative defaults)
+    # If you prefer uploads instead of shipping CSVs in the repo, add file_uploaders here and pass them to load_value_table().
+    xt_tbl = load_value_table("data/Top_progression__xT__per_100_possessions.csv")
+    xa_tbl = load_value_table("data/Top_chance_creators__xA__per_100_possessions.csv")
+    best_tbl = load_value_table("data/Best_role-adjusted_attacking_value__per_100_possessions_.csv")
+    worst_tbl = load_value_table("data/Worst_role-adjusted_attacking_value__per_100_possessions_.csv")
+    neg_tbl = load_value_table("data/Net_negative_total_attacking_value__sample_filtered_.csv")
+
+    if xt_tbl.empty and xa_tbl.empty and best_tbl.empty and worst_tbl.empty and neg_tbl.empty:
+        st.info("Player value tables not found. Ensure the CSVs are present in the repo under /data or add upload controls.")
+    else:
+        mu_team = _infer_mu_team_name(xt_tbl if not xt_tbl.empty else (xa_tbl if not xa_tbl.empty else best_tbl))
+        scope = st.radio(
+            "Scope",
+            ["Manchester United Women only", "All teams"],
+            index=0,
+            horizontal=True,
+        )
+        top_n = st.slider("Top N to display", min_value=5, max_value=25, value=10, step=1)
+
+        # Build a unified “profiles” table from xT/xA (they share the same schema in your exports)
+        profiles = xt_tbl.copy() if not xt_tbl.empty else xa_tbl.copy()
+        # Ensure numeric columns exist (common in your exports)
+        for c in ["possessions", "prog_per100pos", "xa_per100pos", "xg_per100pos", "total_per100pos"]:
+            if c in profiles.columns:
+                profiles[c] = pd.to_numeric(profiles[c], errors="coerce")
+
+        # Filters
+        role_opts = sorted(profiles["role_label"].dropna().astype(str).unique().tolist()) if "role_label" in profiles.columns else []
+        roles_sel = st.multiselect("Role filter", role_opts, default=role_opts) if role_opts else []
+        min_poss = 0
+        if "possessions" in profiles.columns and profiles["possessions"].notna().any():
+            max_poss = int(np.nanmax(profiles["possessions"].values))
+            min_poss = st.slider("Minimum possessions", 0, max(1, max_poss), value=min(50, max_poss))
+        else:
+            max_poss = None
+
+        def apply_filters(df_in: pd.DataFrame) -> pd.DataFrame:
+            df_out = df_in.copy()
+            if scope == "Manchester United Women only" and mu_team and "team_name" in df_out.columns:
+                df_out = df_out[df_out["team_name"].astype(str) == str(mu_team)]
+            if roles_sel and "role_label" in df_out.columns:
+                df_out = df_out[df_out["role_label"].astype(str).isin([str(r) for r in roles_sel])]
+            if "possessions" in df_out.columns and min_poss and min_poss > 0:
+                df_out = df_out[pd.to_numeric(df_out["possessions"], errors="coerce").fillna(0) >= min_poss]
+            return df_out
+
+        profiles_f = apply_filters(profiles)
+        best_f = apply_filters(best_tbl) if not best_tbl.empty else best_tbl
+        worst_f = apply_filters(worst_tbl) if not worst_tbl.empty else worst_tbl
+        neg_f = apply_filters(neg_tbl) if not neg_tbl.empty else neg_tbl
+
+        tabs = st.tabs(["Profiles (xT vs xA)", "Leaderboards", "Role-adjusted value", "Negative value"])
+
+        with tabs[0]:
+            st.subheader("Player profiles: progression (xT proxy) vs chance creation (xA)")
+            if profiles_f.empty or "prog_per100pos" not in profiles_f.columns or "xa_per100pos" not in profiles_f.columns:
+                st.info("Profiles table is missing required columns (prog_per100pos / xa_per100pos).")
+            else:
+                fig, ax = plt.subplots(figsize=(8.5, 6))
+                x = pd.to_numeric(profiles_f["prog_per100pos"], errors="coerce")
+                y = pd.to_numeric(profiles_f["xa_per100pos"], errors="coerce")
+                s = None
+                if "possessions" in profiles_f.columns:
+                    s = pd.to_numeric(profiles_f["possessions"], errors="coerce").fillna(0).values
+                    # scale marker sizes gently
+                    s = 10 + (s / (np.nanmax(s) + 1e-9)) * 90
+                ax.scatter(x, y, s=s, alpha=0.75)
+
+                # Median lines (helps interpretation without needing colours)
+                ax.axvline(np.nanmedian(x.values), linestyle="--", linewidth=1)
+                ax.axhline(np.nanmedian(y.values), linestyle="--", linewidth=1)
+
+                ax.set_xlabel("Progression value per 100 possessions (prog_per100pos)")
+                ax.set_ylabel("Chance creation per 100 possessions (xa_per100pos)")
+                ax.set_title("xT vs xA style profile (per 100 possessions)")
+
+                # Annotate MU points (if all teams view)
+                if scope == "All teams" and mu_team and "team_name" in profiles_f.columns and "player_name" in profiles_f.columns:
+                    mu_pts = profiles_f[profiles_f["team_name"].astype(str) == str(mu_team)]
+                    for _, r in mu_pts.iterrows():
+                        ax.annotate(str(r["player_name"]), (float(r["prog_per100pos"]), float(r["xa_per100pos"])), fontsize=8, alpha=0.9)
+
+                st.pyplot(fig, use_container_width=True)
+
+                # Optional: pick a player and show their row
+                if "player_name" in profiles_f.columns:
+                    player_pick = st.selectbox("Inspect a player", sorted(profiles_f["player_name"].astype(str).unique().tolist()))
+                    st.dataframe(profiles_f[profiles_f["player_name"].astype(str) == str(player_pick)], use_container_width=True, hide_index=True)
+
+        with tabs[1]:
+            st.subheader("Leaderboards")
+            c1, c2 = st.columns(2)
+            with c1:
+                if not profiles_f.empty and "player_name" in profiles_f.columns and "prog_per100pos" in profiles_f.columns:
+                    fig, ax = plt.subplots(figsize=(7, 5))
+                    barh_rank(ax, profiles_f, "player_name", "prog_per100pos", f"Top {top_n} progressors (per 100)", top_n=top_n)
+                    st.pyplot(fig, use_container_width=True)
+                else:
+                    st.info("Missing progressor columns in profiles table.")
+
+            with c2:
+                if not profiles_f.empty and "player_name" in profiles_f.columns and "xa_per100pos" in profiles_f.columns:
+                    fig, ax = plt.subplots(figsize=(7, 5))
+                    barh_rank(ax, profiles_f, "player_name", "xa_per100pos", f"Top {top_n} chance creators (per 100)", top_n=top_n)
+                    st.pyplot(fig, use_container_width=True)
+                else:
+                    st.info("Missing chance creation columns in profiles table.")
+
+            if not profiles_f.empty and "player_name" in profiles_f.columns and "total_per100pos" in profiles_f.columns:
+                fig, ax = plt.subplots(figsize=(7, 5))
+                barh_rank(ax, profiles_f, "player_name", "total_per100pos", f"Top {top_n} total attacking value (per 100)", top_n=top_n)
+                st.pyplot(fig, use_container_width=True)
+
+        with tabs[2]:
+            st.subheader("Role-adjusted attacking value (per 100 possessions)")
+            c1, c2 = st.columns(2)
+
+            with c1:
+                if not best_f.empty and "player_name" in best_f.columns:
+                    # Prefer role_adjusted_total100 if present
+                    val_col = "role_adjusted_total100" if "role_adjusted_total100" in best_f.columns else ("total_per100pos" if "total_per100pos" in best_f.columns else None)
+                    if val_col:
+                        fig, ax = plt.subplots(figsize=(7, 5))
+                        barh_rank(ax, best_f, "player_name", val_col, f"Best role-adjusted value (Top {top_n})", top_n=top_n)
+                        st.pyplot(fig, use_container_width=True)
+                    else:
+                        st.info("Best table missing value columns.")
+                else:
+                    st.info("Best role-adjusted table unavailable.")
+
+            with c2:
+                if not worst_f.empty and "player_name" in worst_f.columns:
+                    val_col = "role_adjusted_total100" if "role_adjusted_total100" in worst_f.columns else ("total_per100pos" if "total_per100pos" in worst_f.columns else None)
+                    if val_col:
+                        fig, ax = plt.subplots(figsize=(7, 5))
+                        # ascending=True for 'worst'
+                        barh_rank(ax, worst_f, "player_name", val_col, f"Worst role-adjusted value (Bottom {top_n})", top_n=top_n, ascending=True)
+                        st.pyplot(fig, use_container_width=True)
+                    else:
+                        st.info("Worst table missing value columns.")
+                else:
+                    st.info("Worst role-adjusted table unavailable.")
+
+        with tabs[3]:
+            st.subheader("Net negative attacking value (volume)")
+            if neg_f.empty:
+                st.info("Negative value table unavailable.")
+            else:
+                # total_attacking_value is negative in this export (net negative total)
+                val_col = "total_attacking_value" if "total_attacking_value" in neg_f.columns else None
+                if val_col and "player_name" in neg_f.columns:
+                    fig, ax = plt.subplots(figsize=(8, 5))
+                    d = neg_f.copy()
+                    d[val_col] = pd.to_numeric(d[val_col], errors="coerce")
+                    d = d.dropna(subset=[val_col]).sort_values(val_col, ascending=True).head(top_n)
+                    ax.barh(d["player_name"].astype(str).values[::-1], d[val_col].values[::-1])
+                    ax.set_title(f"Most negative total attacking value (Top {top_n})")
+                    ax.set_xlabel(val_col)
+                    st.pyplot(fig, use_container_width=True)
+
+                st.dataframe(neg_f, use_container_width=True, hide_index=True)
+
+        # Optional link to your existing passing network section (best-effort)
+        st.caption("Tip: use the player picker above to cross-check passing network + possession outcomes for the same player in other sections.")
+
