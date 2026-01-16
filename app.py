@@ -300,7 +300,7 @@ st.caption(
 def load_value_table(rel_path: str, uploaded_file=None) -> pd.DataFrame:
     """
     Load a player-value table either from a repo-relative path (recommended for Streamlit Cloud)
-    or from an uploaded file.
+#     or from an uploaded file.
     """
     df = None
     if uploaded_file is not None:
@@ -355,60 +355,47 @@ df = None
 
 with st.sidebar:
     st.header("Data")
+    st.caption("Data is auto-loaded from the repository /data folder (no manual selection).")
 
-    BASE_DIR = os.path.dirname(__file__)
-    DATA_DIR = os.path.join(BASE_DIR, "data")
-
-    st.caption("This app auto-loads data from the repo /data folder (recommended). Upload is only a fallback.")
-
-    uploaded = st.file_uploader("Upload possessions CSV (fallback only)", type=["csv"])
-
-# --- Auto-load possessions dataset from repo ---
 BASE_DIR = os.path.dirname(__file__)
 DATA_DIR = os.path.join(BASE_DIR, "data")
 
-# Prefer explicit known filename first
-preferred = os.path.join(DATA_DIR, "MUWFCPOSSESSIONS.csv")
-
-def _is_player_value_table(name: str) -> bool:
-    n = name.lower()
-    return any(k in n for k in [
-        "top_progression",
-        "top_chance_creators",
-        "role-adjusted",
-        "net_negative",
-        "attacking_value",
-        "xa",
-        "xt",
-    ])
-
-repo_csvs = []
-if os.path.isdir(DATA_DIR):
-    repo_csvs = [f for f in os.listdir(DATA_DIR) if f.lower().endswith(".csv")]
-
-possessions_path = None
-if os.path.exists(preferred):
-    possessions_path = preferred
-else:
-    candidates = [f for f in repo_csvs if not _is_player_value_table(f)]
-    if candidates:
-        sizes = [(os.path.getsize(os.path.join(DATA_DIR, f)), f) for f in candidates]
-        sizes.sort(reverse=True)
-        possessions_path = os.path.join(DATA_DIR, sizes[0][1])
-
-if possessions_path is not None:
-    df = load_from_path(possessions_path)
-elif uploaded is not None:
-    df = load_possessions(uploaded.getvalue())
-else:
-    st.error(
-        "No possessions CSV found. Add MUWFCPOSSESSIONS.csv to the repo /data folder "
-        "or upload a CSV in the sidebar."
-    )
+# --- Load possessions data (required) ---
+POSS_FILE = os.path.join(DATA_DIR, "MUWFCPOSSESSIONS.csv")
+if not os.path.exists(POSS_FILE):
+    st.error("MUWFCPOSSESSIONS.csv not found in /data. Please add it to your GitHub repo under /data.")
     st.stop()
+
+# Use existing loader to keep parsing logic consistent
+df = load_from_path(POSS_FILE)
+
+# --- Load player value tables (optional; used by the Player Attacking Impact section) ---
+def _load_optional(rel_name: str) -> pd.DataFrame:
+    p = os.path.join(DATA_DIR, rel_name)
+    if os.path.exists(p):
+        try:
+            return pd.read_csv(p)
+        except Exception:
+            return pd.DataFrame()
+    return pd.DataFrame()
+
+xt_tbl = _load_optional("Top_progression__xT__per_100_possessions.csv")
+xa_tbl = _load_optional("Top_chance_creators__xA__per_100_possessions.csv")
+best_tbl = _load_optional("Best_role-adjusted_attacking_value__per_100_possessions_.csv")
+worst_tbl = _load_optional("Worst_role-adjusted_attacking_value__per_100_possessions_.csv")
+neg_tbl = _load_optional("Net_negative_total_attacking_value__sample_filtered_.csv")
+
+with st.sidebar.expander("Data status", expanded=False):
+    st.write("Possessions:", os.path.basename(POSS_FILE), f"({df.shape[0]} rows)")
+    st.write("xT table:", "✅" if not xt_tbl.empty else "❌ missing")
+    st.write("xA table:", "✅" if not xa_tbl.empty else "❌ missing")
+    st.write("Best role-adjusted:", "✅" if not best_tbl.empty else "❌ missing")
+    st.write("Worst role-adjusted:", "✅" if not worst_tbl.empty else "❌ missing")
+    st.write("Net negative:", "✅" if not neg_tbl.empty else "❌ missing")
+
     df = load_from_path(os.path.join(DATA_DIR, selected_repo_file))
-elif uploaded is not None:
-    df = load_possessions(uploaded.getvalue())
+# elif uploaded is not None:
+#     df = load_possessions(uploaded.getvalue())
 else:
     st.info("Upload a CSV, or add your file to the repo under /data and select it above.")
     st.stop()
@@ -831,29 +818,6 @@ with dist_col2:
     st.pyplot(fig, use_container_width=True)
 
 # --- Player involvement ---
-
-
-# --- Data status (auto-loaded from /data) ---
-with st.sidebar.expander("Data status", expanded=False):
-    st.write("Possessions CSV:", os.path.basename(possessions_path) if "possessions_path" in globals() and possessions_path else "Uploaded / not found")
-    st.write("Possessions rows:", int(df.shape[0]) if "df" in globals() and hasattr(df, "shape") else "—")
-
-    def _status_one(label: str, rel_path: str):
-        p = os.path.join(os.path.dirname(__file__), rel_path)
-        if os.path.exists(p):
-            try:
-                tmp = pd.read_csv(p)
-                st.write(f"{label}: ✅ ({tmp.shape[0]} rows)")
-            except Exception:
-                st.write(f"{label}: ⚠️ (found, but couldn't read)")
-        else:
-            st.write(f"{label}: ❌ (missing)")
-
-    _status_one("xT table", "data/Top_progression__xT__per_100_possessions.csv")
-    _status_one("xA table", "data/Top_chance_creators__xA__per_100_possessions.csv")
-    _status_one("Best role-adjusted", "data/Best_role-adjusted_attacking_value__per_100_possessions_.csv")
-    _status_one("Worst role-adjusted", "data/Worst_role-adjusted_attacking_value__per_100_possessions_.csv")
-    _status_one("Net negative value", "data/Net_negative_total_attacking_value__sample_filtered_.csv")
 
 # ============================================================
 # Advanced effectiveness dashboard (filters + multi-team charts)
@@ -1625,10 +1589,10 @@ st.divider()
 st.header("Player attacking impact & value (xT / xA / role-adjusted)")
 
 with st.expander("Show player value dashboards", expanded=True):
-    st.caption("Uses the uploaded player-value CSV tables (xT/xA per 100 possessions, role-adjusted value, and net negative value).")
+#     st.caption("Uses the uploaded player-value CSV tables (xT/xA per 100 possessions, role-adjusted value, and net negative value).")
 
     # Load tables (repo-relative defaults)
-    # If you prefer uploads instead of shipping CSVs in the repo, add file_uploaders here and pass them to load_value_table().
+#     # If you prefer uploads instead of shipping CSVs in the repo, add file_uploaders here and pass them to load_value_table().
     xt_tbl = load_value_table("data/Top_progression__xT__per_100_possessions.csv")
     xa_tbl = load_value_table("data/Top_chance_creators__xA__per_100_possessions.csv")
     best_tbl = load_value_table("data/Best_role-adjusted_attacking_value__per_100_possessions_.csv")
@@ -1792,4 +1756,3 @@ with st.expander("Show player value dashboards", expanded=True):
 
         # Optional link to your existing passing network section (best-effort)
         st.caption("Tip: use the player picker above to cross-check passing network + possession outcomes for the same player in other sections.")
-
