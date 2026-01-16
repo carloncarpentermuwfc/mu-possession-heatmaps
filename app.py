@@ -355,15 +355,53 @@ df = None
 
 with st.sidebar:
     st.header("Data")
-    use_local = st.checkbox("Use local file data/possessions.csv", value=os.path.exists(default_path))
-    uploaded = None if use_local else st.file_uploader("Upload CSV", type=["csv"])
 
-if use_local and os.path.exists(default_path):
-    df = load_from_path(default_path)
+    BASE_DIR = os.path.dirname(__file__)
+    DATA_DIR = os.path.join(BASE_DIR, "data")
+
+    # Prefer a sensible default filename if present
+    candidate_defaults = [
+        os.path.join(DATA_DIR, "MUWFCPOSSESSIONS.csv"),
+        os.path.join(DATA_DIR, "possessions.csv"),
+        os.path.join(DATA_DIR, "data.csv"),
+    ]
+    default_path = next((p for p in candidate_defaults if os.path.exists(p)), candidate_defaults[0])
+
+    mode = st.radio(
+        "Load mode",
+        ["Use repo data (recommended)", "Upload CSV"],
+        index=0,
+        horizontal=True,
+    )
+
+    repo_files = []
+    if os.path.isdir(DATA_DIR):
+        repo_files = sorted([f for f in os.listdir(DATA_DIR) if f.lower().endswith(".csv")])
+
+    if mode == "Use repo data (recommended)":
+        if not repo_files:
+            st.warning("No CSV files found in the repo /data folder.")
+            selected_repo_file = None
+        else:
+            # Default selection: whichever matches default_path if possible
+            default_name = os.path.basename(default_path)
+            default_idx = repo_files.index(default_name) if default_name in repo_files else 0
+            selected_repo_file = st.selectbox("Choose a CSV from /data", repo_files, index=default_idx)
+
+        uploaded = None
+    else:
+        selected_repo_file = None
+        uploaded = st.file_uploader("Upload CSV", type=["csv"])
+
+if mode == "Use repo data (recommended)":
+    if selected_repo_file is None:
+        st.info("Add your CSV to the repo under /data, then refresh.")
+        st.stop()
+    df = load_from_path(os.path.join(DATA_DIR, selected_repo_file))
 elif uploaded is not None:
     df = load_possessions(uploaded.getvalue())
 else:
-    st.info("Upload a CSV, or add your file to `data/possessions.csv` and tick the checkbox in the sidebar.")
+    st.info("Upload a CSV, or add your file to the repo under /data and select it above.")
     st.stop()
 
 # Required columns
